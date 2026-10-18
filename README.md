@@ -1,351 +1,187 @@
-> **Remote Claude — macOS friends trial**
->
-> This repository contains the configurable SSH Remote Claude fork. Start with [朋友试用说明](docs/remote-claude-trial.zh-CN.md) and [Remote build instructions](README.remote-vps.md). Upstream attribution and licensing provenance: [UPSTREAM-NOTICE.md](UPSTREAM-NOTICE.md). The upstream README is preserved below.
+<img src="src-tauri/icons/remote-claude/icon.png" alt="Remote Claude" width="80" height="80">
 
-<div align="center">
+# Remote Claude
 
-# Desktop CC GUI
+**在 Mac 上使用自己的 VPS，运行 Claude Code。**
 
-<img width="120" alt="ccgui icon" src="./public/app-icon.png" />
+Remote Claude 是一个 macOS 桌面客户端，通过 SSH 连接 Linux VPS，在本地窗口中管理远程项目、与 Claude Code 对话、查看文件和使用终端。你使用自己的服务器与 Claude 账号；Claude Code、项目文件和账号登录保存在 VPS，界面和历史缓存保存在 Mac。
 
-**English** · [简体中文](./README.zh-CN.md)
+本项目基于 [CC GUI](https://github.com/zhukunpenglinyutong/desktop-cc-gui) 开发，专注于 Claude Code 的远程工作区体验，是独立的第三方客户端。
 
-<a href="https://trendshift.io/repositories/25546" target="_blank"><img src="https://trendshift.io/api/badge/repositories/25546" alt="zhukunpenglinyutong%2Fdesktop-cc-gui | Trendshift" style="width: 250px; height: 55px;" width="250" height="55"/></a>
-<a href="https://atomgit.com/zhukunpenglinyutong/desktop-cc-gui" target="_blank"><img src="https://atomgit.com/zhukunpenglinyutong/desktop-cc-gui/star/new_badge.svg" alt="AtomGit G-Star" width="250" height="54"/></a>
+> 当前为预览版。已验证的安装包面向 Apple Silicon Mac，采用 ad-hoc 签名，尚未完成 Apple 公证。安装包由维护者单独提供；源码仓库不包含编译产物。
 
-![][github-contributors-shield] ![][github-forks-shield] ![][github-stars-shield] ![][github-issues-shield] ![platform](https://img.shields.io/badge/platform-macOS%20%7C%20Windows%20%7C%20Linux-c4f042?labelColor=black&style=flat-square)
+## 主要功能
 
-</div>
+- **远程对话**：流式回复、工具调用展示、权限问答和任务停止。
+- **项目管理**：添加 VPS 上的已有项目，或在选定父目录下创建新项目。
+- **文件与 Git**：浏览、编辑、搜索远程文件，执行常用 Git 操作。
+- **集成终端**：在窗口底部直接使用 VPS 的 SSH 终端。
+- **历史缓存**：优先展示本地缓存，后台更新；断网时仍可查看已缓存会话。
+- **用量展示**：分别查看上下文用量，以及支持该查询的 Claude 账号 5 小时和周额度。
+- **首次连接引导**：选择本机私钥、核验服务器指纹、检查远端工具和 Claude 登录状态。
 
-**ccgui** is an open-source **multi-engine AI coding desktop client**. In plain words: it brings command-line AI coding runtimes — **Claude Code**, **Codex CLI**, **Kimi CLI**, **Grok CLI**, **Pi CLI**, **OMP CLI**, **DeepSeek Harness (DSH)**, **Antigravity**, **OpenCode**, **Qoder**, and **MiniMax Code** — into one graphical interface.
-
-No more staring at a black terminal. Open ccgui, pick a project, and chat with AI to write code, fix bugs, and commit to Git. Streaming output, thinking traces, and tool calls are visible as they happen; token usage appears when the engine reports it.
-
-The app is built with **Tauri 2 + React 18 + TypeScript + Rust** and runs on macOS, Windows, and Linux. Settings and state are persisted locally. Content sent to an AI provider follows the boundary of the channel you configured for that CLI.
-
----
-
-## Supported engines
-
-Every engine below is wired in through a **dedicated protocol adapter** in the Rust backend — streaming events, session history, and provider channels are handled natively, not scraped off a terminal screen.
-
-<p>
-  <a href="https://code.claude.com/docs/en/cli-reference"><kbd><img src="https://www.google.com/s2/favicons?domain=anthropic.com&sz=64" alt="Claude Code logo" width="16" valign="middle" /> Claude Code</kbd></a> &nbsp;
-  <a href="https://github.com/openai/codex"><kbd><img src="https://www.google.com/s2/favicons?domain=openai.com&sz=64" alt="Codex CLI logo" width="16" valign="middle" /> Codex CLI</kbd></a> &nbsp;
-  <a href="https://www.kimi.com/code/docs/en/"><kbd><img src="https://www.google.com/s2/favicons?domain=moonshot.cn&sz=64" alt="Kimi CLI logo" width="16" valign="middle" /> Kimi CLI</kbd></a> &nbsp;
-  <a href="https://x.ai/cli"><kbd><img src="https://www.google.com/s2/favicons?domain=x.ai&sz=64" alt="Grok CLI logo" width="16" valign="middle" /> Grok CLI</kbd></a> &nbsp;
-  <a href="https://pi.dev"><kbd><img src="https://pi.dev/favicon.svg" alt="Pi CLI logo" width="16" valign="middle" /> Pi CLI</kbd></a> &nbsp;
-  <a href="https://omp.sh"><kbd><img src="https://omp.sh/favicon.svg" alt="oh-my-pi logo" width="16" valign="middle" /> OMP CLI</kbd></a> &nbsp;
-  <a href="https://github.com/deepseek-ai/dsh"><kbd><img src="https://www.google.com/s2/favicons?domain=deepseek.com&sz=64" alt="DeepSeek Harness logo" width="16" valign="middle" /> DeepSeek Harness</kbd></a> &nbsp;
-  <a href="https://www.antigravity.google/docs/cli/headless/"><kbd><img src="https://www.google.com/s2/favicons?domain=antigravity.google&sz=64" alt="Antigravity logo" width="16" valign="middle" /> Antigravity</kbd></a> &nbsp;
-  <a href="https://opencode.ai/docs/"><kbd><img src="https://www.google.com/s2/favicons?domain=opencode.ai&sz=64" alt="OpenCode logo" width="16" valign="middle" /> OpenCode</kbd></a> &nbsp;
-  <a href="https://docs.qoder.com/en/cli/using-cli"><kbd><img src="https://www.google.com/s2/favicons?domain=qoder.com&sz=64" alt="Qoder logo" width="16" valign="middle" /> Qoder</kbd></a> &nbsp;
-  <a href="https://agent.minimax.cn/docs/cli/quick-start"><kbd><img src="./src/assets/model-icons/minimax-code.png" alt="MiniMax Code logo" width="16" valign="middle" /> MiniMax Code</kbd></a>
-</p>
-
-### Feature compatibility matrix
-
-Legend: ✅ Supported · ⚠️ Partial · ❌ Not yet supported · 🔁 Not supported by the CLI, but ccgui has a GUI equivalent · ➖ N/A
-
-| Feature | <kbd><img src="https://www.google.com/s2/favicons?domain=anthropic.com&sz=64" width="16" valign="middle" /> Claude Code</kbd> | <kbd><img src="https://www.google.com/s2/favicons?domain=openai.com&sz=64" width="16" valign="middle" /> Codex CLI</kbd> | <kbd><img src="https://www.google.com/s2/favicons?domain=moonshot.cn&sz=64" width="16" valign="middle" /> Kimi CLI</kbd> | <kbd><img src="https://www.google.com/s2/favicons?domain=x.ai&sz=64" width="16" valign="middle" /> Grok CLI</kbd> | <kbd><img src="https://pi.dev/favicon.svg" width="16" valign="middle" /> Pi CLI</kbd> | <kbd><img src="https://omp.sh/favicon.svg" width="16" valign="middle" /> OMP CLI</kbd> | <kbd><img src="https://www.google.com/s2/favicons?domain=deepseek.com&sz=64" width="16" valign="middle" /> DSH</kbd> | <kbd><img src="https://www.google.com/s2/favicons?domain=antigravity.google&sz=64" width="16" valign="middle" /> Antigravity</kbd> | <kbd><img src="https://www.google.com/s2/favicons?domain=opencode.ai&sz=64" width="16" valign="middle" /> OpenCode</kbd> | <kbd><img src="https://www.google.com/s2/favicons?domain=qoder.com&sz=64" width="16" valign="middle" /> Qoder (Global/CN)</kbd> | <kbd><img src="./src/assets/model-icons/minimax-code.png" width="16" valign="middle" /> MiniMax Code</kbd> |
-| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| Streaming output (per-token) | ✅ | ✅ | ❌ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
-| Session history & resume | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
-| Interrupt (Stop) | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
-| Message queue | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
-| Image attachments | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ❌ | ✅ | ✅ | ✅ |
-| Permission modes | auto·manual·plan·bypass | auto·manual·bypass | auto·plan·bypass | bypass only | auto only | auto·plan·bypass | auto only | auto·plan·bypass | auto·plan | bypass only | auto·manual·plan·bypass |
-| Model picker | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
-| Reasoning effort | ✅ | ✅ | ❌ | ❌ | ✅ | ✅ | ❌ | ⚠️ | ❌ | ✅ | ⚠️ |
-| Token usage & context window | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ⚠️ | ✅ | ✅ |
-| Todo list rendering | ✅ | ❌ | ❌ | ❌ | ✅ | ✅ | ❌ | ❌ | ❌ | ❌ | ❌ |
-| Sub-agent display (dispatch panel) | ✅ | ✅ | ✅ | ❌ | ✅ | ✅ | ✅ | ⚠️ | ⚠️ | ⚠️ | ❌ |
-| Team mode (multi-agent orchestration) | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ |
-| `/` slash commands & skills (picker) | ✅ | ✅ | ⚠️ | ⚠️ | ⚠️ | ⚠️ | ⚠️ | ❌ | ⚠️ | ⚠️ | ❌ |
-| `@` file mentions | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
-| Provider/channel switching | ✅ | ✅ | ✅ | ✅ | ⚠️ | ⚠️ | ⚠️ | ⚠️ | ⚠️ | ⚠️ | ❌ |
-| CC Switch import | ✅ | ✅ | ❌ | ✅ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ |
-| Fast mode (service tier) | ❌ | ✅ | ❌ | ❌ | ❌ | ✅ | ❌ | ❌ | ❌ | ❌ | ❌ |
-| Session rename | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
-| Native command `/new` (new session) | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
-| Native command `/clear` (clear context) | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
-| Native command `/compact` (compact context) | ✅ | ⚠️ | ⚠️ | ⚠️ | ⚠️ | ✅ | ⚠️ | ⚠️ | ⚠️ | ⚠️ | ⚠️ |
-| Native command `ask` (question cards) | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ❌ | ✅ | ❌ | ✅ |
-| Native command `/mcp` | ❌ | ❌ | ❌ | ❌ | ❌ | ✅ | ❌ | ❌ | ❌ | ❌ | ❌ |
-| Native command `/plugins` | ➖ | ➖ | ➖ | ➖ | ❌ | ✅ | ➖ | ➖ | ➖ | ➖ | ➖ |
-| Native command `/goal` (persistent goal) | ➖ | ➖ | ➖ | ➖ | ➖ | ❌ | ➖ | ➖ | ➖ | ➖ | ➖ |
-
-Kimi question cards use the local CLI's ACP form channel (verified with Kimi 2.0.2), including multiple questions, multiple selections, dismissal, and interruption. Kimi currently accepts declared options only, so these cards do not offer a free-text “Other” answer. WSL workspaces retain the non-interactive CLI fallback and do not support Kimi question cards or plan mode; prompt-mode launches never add incompatible interactive permission flags.
-
-MiniMax Code (command `mcode`) runs through its native ACP transport (`mcode acp`): per-token streaming, permission question cards (ACP `session/request_permission`), and session resume are wired natively and verified against mcode 0.5.1. The model picker is probed live from the session handshake, so providers you add to mcode itself (e.g. a GLM channel) appear automatically. mcode's ACP does not accept inline image blocks, so pictures travel as absolute file paths the agent reads with its own tools. Reasoning effort folds into mcode's model variants rather than a separate knob. WSL workspaces fall back to the headless `mcode exec --output-format stream-json` child (auto/bypass only there — no question cards or plan mode). Provider channels and the app's MCP/Skills sync do not cover this engine yet; sign in with `mcode login`.
-
----
-## What can ccgui do?
-
-### One client, eleven AI engines
-
-- Registers runtime adapters for **Claude Code**, **Codex CLI**, **Kimi CLI**, **Grok CLI**, **Pi CLI**, **OMP CLI**, **DeepSeek Harness**, **Antigravity**, **OpenCode**, **Qoder** (global and CN distributions), and **MiniMax Code** — pick the engine per session from the composer.
-- **Provider channels** are written to each CLI's own native config files (no parallel credential store), with curated presets for GLM, Kimi, DeepSeek, MiniMax, MiMo, Bailian, LongCat, OpenCode Go, OpenRouter, Requesty, [API Route](https://www.api-route.com), and more. Claude / Codex / Grok channels can be imported from [CC Switch](https://github.com/farion1231/cc-switch).
-
-  To use API Route, create an API key in its dashboard and select the **API Route** preset in Settings for Claude or Codex. Claude uses the Anthropic-compatible root endpoint; Codex uses `/v1` with the Responses protocol. Adjust the preset's model names to models available to your key; see the [API Route setup guide](https://www.api-route.com/docs/quickstart).
-- Pi-family engines (Pi / OMP) support API-key and OAuth sign-in flows from inside Settings.
-- Per-tab **model and effort overrides**: different tabs in the same window can run different models or thinking levels.
-- Session history survives restarts; the history scanner reads each CLI's native session files and keeps titles in sync.
-
-### A chat box designed for coding
-
-- Streaming replies are revealed per animation frame with cached syntax highlighting — long outputs stay smooth instead of re-parsing markdown on every token.
-- **Thinking streams** merge with the reply text, auto-fold when they settle, and expand to full text on demand.
-- Tool calls show as live rows with expandable parameters and results, including beautified **Git Diff** and **Bash** viewers and per-run completion metadata.
-- A **Run Status Strip** mirrors the engine's live progress (including todo snapshots), and a message **anchor rail** lets you jump between user messages.
-- Pasted images become attachments; file mentions are backed by a `.gitignore`-aware project file index; file links in replies handle URL-encoded paths and have a right-click menu.
-- Permission denials can be resolved inline by granting the engine extra directories; prompt history and an optional **Codex Fast** toggle live in the composer.
-
-### Not just chat — a full set of dev panels
-
-- **File tree**: virtualized, with Git status colors, nested-repository badges, context menus, and drag-and-drop — plus a built-in CodeMirror editor pane with Markdown preview.
-- **Built-in terminal**: a real PTY-backed terminal dock (xterm + WebGL), no need to switch windows.
-- **Git panel**: stage, commit, search branches, inspect diffs and history.
-- **Command palette**: one keyboard-driven box for the app's commands.
-
-### Plugin system
-
-- First-party **plugin SDK** (`@ccgui/plugin-sdk`) plus an in-app runtime, manager UI, and trust boundary.
-- **Declarative plugins** can add settings sections and config-driven UI without shipping frontend code; builtin app surfaces (including the settings page itself) are registered through the same extension points.
-- See [docs/plugin-development-guide.zh-CN.md](./docs/plugin-development-guide.zh-CN.md) for the full authoring guide.
-
-### Settings, network, and updates
-
-- **Proxy settings** for the app and engine traffic.
-- **LAN web access**: serve the UI to other devices on your network over a token-authenticated WebSocket bridge, with a QR-code entry in Settings.
-- **Workspace management**: group projects and switch between them.
-- In-app **auto-update** (Tauri updater against GitHub Releases), a changelog dialog, and signed macOS builds.
-- Bilingual UI: **Chinese and English**.
-
----
-
-## Download
-
-Grab the installer for your platform from the [Releases page](https://github.com/zhukunpenglinyutong/desktop-cc-gui/releases):
-
-| Platform | Installer |
-| --- | --- |
-| macOS (Apple Silicon, signed) | `aarch64.dmg` |
-| Windows | `.exe` (NSIS) |
-| Linux | `.AppImage`, `.rpm` |
-
-The `.rpm` is zstd-compressed and requires rpm ≥ 4.14 (Fedora 28+, RHEL 8+); on older rpm-based systems use the AppImage instead.
-
-After installing, open Settings, configure a provider channel for the CLI you want (or sign in), add a project folder, and start chatting.
-
-### Using DeepSeek Harness (DSH)
-
-1. Install the DSH CLI on your machine and configure its models and API keys in DSH itself — not as a separate vendor preset inside ccgui.
-2. In Settings → DeepSeek Harness, ccgui can adopt a running local `dsh web` host or auto-start one.
-3. Select **DeepSeek Harness** in the composer engine picker. Chat runs through DSH's headless profile; models and credentials stay in DSH.
-4. Image attachments (paste, pick, or drop) are supported. For custom providers added in DSH (`llm-pi-ai` routes), ccgui declares image input on the route before sending — no manual DSH settings edit needed; official adapters report their own capabilities.
-
----
-
-## Getting it running (setup guide)
-
-Want to build it yourself or contribute? Three steps.
-
-### Step 1: Prepare your environment
-
-| Tool | Version | What for |
-| --- | --- | --- |
-| [Node.js](https://nodejs.org/) | 20 or newer | Runs the frontend toolchain |
-| [pnpm](https://pnpm.io/) | 10 (pinned via `packageManager`) | Installs dependencies |
-| [Rust](https://rustup.rs/) | stable (install via rustup) | Compiles the backend |
-
-Each OS also needs the standard Tauri prerequisites — see the [official Tauri guide](https://v2.tauri.app/start/prerequisites/):
-
-- **macOS**: `xcode-select --install`.
-- **Windows**: Microsoft C++ Build Tools and WebView2 (Windows 11 ships with WebView2).
-- **Linux**: `webkit2gtk` and friends — copy the commands from the Tauri docs.
-
-### Step 2: Install dependencies
-
-```bash
-git clone https://github.com/zhukunpenglinyutong/desktop-cc-gui.git
-cd desktop-cc-gui
-pnpm install
-```
-
-Note: this is a **pnpm workspace** (the plugin SDK lives in `packages/plugin-sdk`); the lockfile is `pnpm-lock.yaml`.
-
-### Step 3: Start it
-
-```bash
-pnpm dev
-```
-
-A few tips:
-
-- **The first launch compiles the entire Rust backend and can take a few minutes** — go grab a coffee. Later launches use incremental builds and are fast.
-- The frontend dev server runs on port `1420`.
-
-### Building installers
-
-```bash
-pnpm build:mac                 # macOS signed build (scripts/build-signed-macos.sh)
-pnpm build:mac:skip-notarize   # same, skipping notarization
-```
-
-Windows and Linux installers are produced by the CI workflows under `.github/workflows/` (`release.yml`, `build-windows-artifact.yml`).
-
----
-
-## How to work on the code (development guide)
-
-### Tech stack at a glance
-
-| Part | Technology |
-| --- | --- |
-| UI | React 18 + TypeScript + Tailwind CSS 4 + zustand |
-| Build | Vite 6 |
-| Desktop shell | Tauri 2 (Rust backend: git2, rusqlite, portable-pty, axum) |
-| Tests | Vitest (frontend) + cargo test (Rust) |
-
-### Directory layout
+## 工作方式
 
 ```text
-desktop-cc-gui/
-├── src/                    # Frontend code
-│   ├── features/           # ★ Feature modules: chat / files / git / terminal /
-│   │                       #   settings / plugins / commands / update / open-app
-│   ├── components/         # Shared UI components (incl. engine brand icons)
-│   ├── i18n/               # zh + en locale bundles
-│   ├── styles/             # Global styles
-│   └── lib/ utils/         # Utility functions
-├── src-tauri/              # Rust backend
-│   └── src/                # engine/ (one module per CLI), history/, plugins/,
-│                           # git.rs, terminal.rs, web.rs (LAN bridge), ...
-├── packages/plugin-sdk/    # @ccgui/plugin-sdk — plugin authoring kit
-├── tests/                  # Frontend integration-style tests (Vitest)
-├── scripts/                # Build and packaging scripts
-└── docs/                   # Plugin development guide, engine mode notes
+Mac · Remote Claude
+  聊天界面 / 连接设置 / 本地历史缓存
+                │
+          SSH 密钥认证
+                │
+Linux VPS
+  Claude Code / 项目文件 / Git / Shell
+                │
+       用户自己的 Claude 账号
 ```
 
-### The typical workflow for changing a feature
+Mac 无需安装 Claude Code，VPS 无需部署额外的 Web 服务。客户端使用 SSH 密钥认证，并保留 OpenSSH 的主机身份校验。
 
-1. **UI-only change**: find the matching module under `src/features/` and edit there. New components live inside that feature's own folder.
-2. **Needs backend support**: add a `#[tauri::command]` in the matching `src-tauri/src/` module and call it from the frontend via the Tauri API.
-3. **Changed any UI text**: route it through i18n and keep both bundles (`src/i18n/zh.ts`, `src/i18n/en.ts`) synchronized — hardcoded UI text is not allowed.
+## 使用要求
 
-### Everyday commands
-
-| Command | What it does |
+| 环境 | 要求 |
 | --- | --- |
-| `pnpm dev` | Start the full app (Tauri dev mode) |
-| `pnpm build` | TypeScript check + frontend production build |
-| `pnpm test` | Run the Vitest suite |
-| `pnpm preview` | Preview the production frontend build |
-| `cargo test --manifest-path src-tauri/Cargo.toml` | Run Rust tests |
+| Mac | macOS；当前已验证 Apple Silicon 安装包 |
+| VPS | 可通过 SSH 访问的 Linux 主机，以及可访问项目目录的用户 |
+| 必需工具 | VPS 上的 Bash、Python 3、Claude Code |
+| 可选工具 | VPS 上的 Git，用于 Git 功能 |
+| Claude 登录 | VPS 对应用户已登录具备 Claude Code 使用权限的账号；CLI 支持结构化登录状态查询 |
+| SSH 认证 | Mac 上可用的 SSH 私钥、系统默认密钥或 SSH agent |
+| 网络 | Mac 能访问 VPS 的 SSH 端口；VPS 能访问 Claude 服务 |
 
-### Writing tests
+Claude Code 的安装与登录方式见 [官方说明](https://code.claude.com/docs/en/setup)。
 
-- Frontend tests use [Vitest](https://vitest.dev/) — colocated `xxx.test.ts(x)` files next to the source, plus heavier suites under `tests/`.
-- Rust tests live in their modules as usual and run with `cargo test --manifest-path src-tauri/Cargo.toml`.
+## 快速开始
 
----
+### 1. 准备 VPS 和 SSH
 
-## Coding rules
+在 VPS 上安装所需工具，以准备使用的 Linux 用户运行 `claude` 并完成登录。先确认终端中能够正常使用 Claude Code。
 
-Not many rules, but each exists for a reason:
+将 Mac 的 SSH 公钥加入 VPS 对应用户的 `~/.ssh/authorized_keys`。私钥保留在 Mac；加密私钥可以先通过 `ssh-add` 加载到系统 SSH agent。
 
-1. **Run the big three before opening a PR**: `pnpm build` (typecheck) and `pnpm test` green locally, plus `cargo test` if you touched Rust.
-2. **UI text must go through i18n**: every user-visible string comes from `src/i18n/`, and both shipped locale bundles must stay synchronized.
-3. **Keep components close to home**: new components start inside their own feature folder; promote to `src/components/` only once they're genuinely reused across features.
-4. **TypeScript strict**: don't paper over things with `any`; write real types.
-5. **Extend through the plugin SDK where possible**: new settings sections and surfaces should register through the same extension points the builtin ones use.
-6. **Never commit secrets**: API keys and tokens must never appear in code or commit history.
+从云厂商控制台或已有的可信服务器会话取得 SSH 主机 SHA256 指纹，用于首次连接时核验服务器身份。
 
-### Writing commit messages
+详细步骤见 [安装与首次连接指南](docs/remote-claude-trial.zh-CN.md)。
 
-Use [Conventional Commits](https://www.conventionalcommits.org/) with a Chinese action phrase by default: `type(scope): 中文动宾短句`.
+### 2. 安装应用
 
-| type | When to use |
+取得与你的 Mac 芯片匹配的安装包及校验清单。打开 DMG，将 `Remote Claude.app` 拖入 `Applications`，然后启动应用。
+
+当前提供的预览包未经 Apple 公证，macOS 可能提示无法验证开发者。请核对包的来源与 SHA256，并按系统提供的安全提示处理。正式签名与公证的构建入口见下方说明。
+
+### 3. 添加远程项目
+
+打开 **设置 → 工作区 → SSH 远程项目**，填写连接信息：
+
+| 配置项 | 说明 |
 | --- | --- |
-| `feat` | New feature |
-| `fix` | Bug fix |
-| `refactor` | Refactoring (no behavior change) |
-| `docs` | Documentation |
-| `test` | Adding/updating tests |
-| `chore` | Housekeeping (version bumps, deps, scripts) |
-| `perf` / `style` / `ci` | Performance / formatting / CI |
+| SSH 主机 | VPS 的 IP 地址或 DNS 名称 |
+| SSH 用户 | VPS 上已准备好 Claude Code 和项目权限的 Linux 用户 |
+| SSH 端口 | 默认 `22` |
+| 私钥 | 用文件选择器选择这台 Mac 上的私钥；留空使用默认密钥或 SSH agent |
+| 项目目录 | 默认 `~`，表示远程用户主目录；连接后可浏览并选择项目文件夹 |
 
-Real examples from this repo:
+点击 **连接并浏览目录**。首次接入新主机时，核对显示的指纹与可信渠道取得的指纹，确认一致后显式信任。应用随后检查工具和 Claude 登录状态；准备就绪后，选择项目目录并点击 **添加此远程项目**。
+
+主机密钥发生变化时，应用会阻止连接，不会自动替换原有信任记录。
+
+### 4. 开始使用
+
+从侧边栏打开项目并创建会话。聊天、文件操作、Git 和底部终端均作用于该 VPS。
+
+需要新项目时，点击侧边栏的 **新建远程项目**，选择 VPS 上的父目录，填写项目名称，再点击 **创建并添加项目**。同名目录不会被覆盖。
+
+## 数据与凭据
+
+- **本地数据目录**：`~/.ccgui-remote-vps`，保存应用设置、工作区信息和历史缓存。
+- **应用身份**：Bundle ID 为 `local.ccgui.remote-vps`，与上游 CC GUI 的数据目录分开。
+- **SSH 私钥**：客户端保存文件路径，密钥认证由本机 SSH 完成；私钥不会复制到 VPS。
+- **Claude 登录**：由 VPS 上的 Claude Code 管理。账号额度查询也在 VPS 执行，OAuth 令牌不传回 Mac。
+- **模型配置**：远程项目使用 VPS 自身的 Claude 配置，不发送 Mac 上配置的模型渠道密钥。
+- **离线历史**：已缓存的会话可离线查看；首次读取、获取新消息和执行操作需要联网。
+
+上下文用量与账号额度是两个独立指标。额度查询依赖 Claude 内部接口，字段或认证方式可能变化；无法取得数据时显示未知，不推算剩余额度。
+
+## 从源码构建
+
+需要 macOS、Xcode Command Line Tools、Node.js、pnpm 和 Rust stable。项目使用 `pnpm@10.29.3`；制作分发包还需要 Python 3。
+
+```sh
+git clone git@github.com:TianwenWei/remote-claude.git
+cd remote-claude
+pnpm install --frozen-lockfile
+./scripts/build-remote-macos.sh
+```
+
+私有仓库需要相应的 GitHub 访问权限。使用源码 ZIP 时，解压后从安装依赖这一步开始即可。
+
+默认 Release 产物：
 
 ```text
-feat(chat): 支持工具调用参数与结果展开、Git Diff/Bash美化及完成元数据展示
-fix(codex): Windows .cmd shim 下多行提示词只送达第一行
-perf(chat): reveal streamed text per frame without reparsing markdown
+src-tauri/target/release/bundle/macos/Remote Claude.app
 ```
 
-No emoji in commit messages, and no AI-generated signatures.
+开发模式：
 
----
+```sh
+pnpm exec tauri dev --features remote-vps --config src-tauri/tauri.remote.conf.json
+```
 
-## Submitting your code (contribution flow)
+生成开发包：
 
-1. **Fork** the repo and clone it locally.
-2. Branch off `main`, named like `feat/xxx` or `fix/xxx`.
-3. Make your changes and get `pnpm build` + `pnpm test` green locally.
-4. Open a PR against this repo's **`main` branch**. Title in commit format; in the description, explain what changed, why, and how you verified it.
+```sh
+./scripts/build-remote-macos.sh --debug
+```
 
-Not sure where to start? Browse the [Issues](https://github.com/zhukunpenglinyutong/desktop-cc-gui/issues) and pick one that interests you. Found a bug or have an idea? Open an issue and let's talk.
+Remote 构建必须同时使用 `remote-vps` Cargo feature 与 `tauri.remote.conf.json`，以保留独立的应用身份、数据目录和更新配置。上面的构建脚本已经包含这两个参数。
 
-### Want to dig deeper?
+### 制作安装包
 
-- [Plugin development guide (中文)](docs/plugin-development-guide.zh-CN.md) — SDK, manifest, permissions, and the trust boundary.
-- [UI/UX spec (中文)](docs/ui-ux-spec.zh-CN.md) — design tokens, states, action feedback, and the refresh-button inventory.
-- [docs/omp-fast-mode.md](docs/omp-fast-mode.md) — notes on the Codex Fast / OMP fast mode.
+```sh
+python3 scripts/package-remote-macos.py --ad-hoc
+```
 
----
+默认生成 Apple Silicon 预览包，输出到 `artifacts/remote-claude-trial/`，包括 DMG、App ZIP、构建清单和 SHA256。清单记录源码提交、架构、签名和公证状态。
 
-## License
+脚本也提供 Intel、Universal 以及自有 Developer ID 签名和公证参数。这些构建选项不代表对应平台或签名流程已完成验收。完整参数与操作说明见 [Remote 开发与构建说明](README.remote-vps.md)。
 
-[MIT](https://github.com/zhukunpenglinyutong/desktop-cc-gui?tab=MIT-1-ov-file)
+## 验证
 
----
+常用本地检查：
 
-## Friendship Link
+```sh
+pnpm build
+pnpm exec vitest run src/features/settings/SshWorkspacesCard.test.tsx
+cargo test --manifest-path src-tauri/Cargo.toml --features remote-vps --lib engine::ssh_onboarding::tests
+node --test tests/xterm-production.test.mjs
+```
 
-Thanks for the support and feedback from the friends at [LINUX DO](https://linux.do/).
+生产终端回归需要先执行 `pnpm build`。真实 SSH 与模型测试需要显式配置已授权的测试主机，详见 [Remote 开发与构建说明](README.remote-vps.md)。
 
-[AtomGit](https://atomgit.com/zhukunpenglinyutong/desktop-cc-gui): hosts this project in China, helping users in mainland China access the project and download Releases faster.
+当前预览包已通过干净源码构建、相关回归、原生启动及已配置 VPS 的只读连接检查；尚未完成不同用户 VPS、Intel Mac 和正式签名分发的兼容性验收。
 
-Thank you for [AtomGit](https://atomgit.com/zhukunpenglinyutong/desktop-cc-gui) platform G-Star certification
+## 当前限制
 
----
+- 当前 Remote 版本面向 macOS 与 Linux VPS；不承诺上游所有引擎或平台的功能均适用于 SSH 工作区。
+- 不支持远程 Worktree 管理、本机电脑操作或本机记忆工具；Worktree 可在远程终端中管理。
+- 不同 SSH 主机使用相同或嵌套项目路径时，工作区注册仍有限制。
+- 首次连接检查对 ProxyJump、ProxyCommand、HostName 重定向、主机证书和自定义撤销策略等高级 SSH 配置有限制。
+- 旧版 Claude Code 无法提供可确认的登录状态时，会阻止首次注册并显示原因。
+- 上游自动更新已禁用；更新应用需手动替换安装包，已有设置和缓存继续保留。
 
-## Contributors
+## 常见问题
 
-Thanks to all the contributors who help make ccgui better.
+| 情况 | 处理方式 |
+| --- | --- |
+| SSH 超时或连接被关闭 | 检查 Mac 到 VPS 的网络、SSH 服务和认证；已缓存的历史仍可查看 |
+| 服务器指纹与记录冲突 | 通过服务器控制台核实主机身份及是否重装，再维护本机 OpenSSH 信任记录 |
+| 找不到 Claude Code 或未登录 | 在 VPS 对应用户的登录环境中安装、登录并检查 Claude Code |
+| 缺少 Git | 聊天项目仍可使用；安装 Git 后再使用 Git 功能 |
+| 账号额度显示未知 | 确认远端登录方式支持该查询；接口不可用时应用不会推算额度 |
 
-<a href="https://github.com/zhukunpenglinyutong/desktop-cc-gui/graphs/contributors">
-  <img src="https://contrib.rocks/image?repo=zhukunpenglinyutong/desktop-cc-gui" alt="Contributors" />
-</a>
+报告问题时，请提供版本、Mac 芯片与系统、错误阶段及错误文字。不要附上私钥、访问令牌或完整会话内容。
 
----
+## 项目来源
 
-## Acknowledgements
+Remote Claude 基于 [zhukunpenglinyutong/desktop-cc-gui](https://github.com/zhukunpenglinyutong/desktop-cc-gui) 的 1.1.4 源码开发。感谢原项目及其贡献者。
 
-This project originally started from [CodexMonitor](https://github.com/Dimillian/CodexMonitor). Since v1.0.0 the codebase has been rewritten from scratch — no CodexMonitor code remains, but the original inspiration is gratefully acknowledged.
-
----
-
-## Star History
-
-[![Star History Chart](https://star-history.dera.page/svg?repos=zhukunpenglinyutong/desktop-cc-gui&type=date&legend=top-left)](https://star-history.dera.page/#zhukunpenglinyutong/desktop-cc-gui&type=date&legend=top-left)
-
-<!-- LINK GROUP -->
-
-[github-contributors-shield]: https://img.shields.io/github/contributors/zhukunpenglinyutong/desktop-cc-gui?color=c4f042&labelColor=black&style=flat-square
-[github-forks-shield]: https://img.shields.io/github/forks/zhukunpenglinyutong/desktop-cc-gui?color=8ae8ff&labelColor=black&style=flat-square
-[github-issues-link]: https://github.com/zhukunpenglinyutong/desktop-cc-gui/issues
-[github-issues-shield]: https://img.shields.io/github/issues/zhukunpenglinyutong/desktop-cc-gui?color=ff80eb&labelColor=black&style=flat-square
-[github-license-link]: https://github.com/zhukunpenglinyutong/desktop-cc-gui/blob/main/LICENSE
-[github-stars-shield]: https://img.shields.io/github/stars/zhukunpenglinyutong/desktop-cc-gui?color=ffcb47&labelColor=black&style=flat-square
+上游许可材料的现状、历史出处与 Claude 图标来源记录在 [UPSTREAM-NOTICE.md](UPSTREAM-NOTICE.md)。Claude 名称和图标属于相应权利人，本项目不是 Anthropic 官方产品。
