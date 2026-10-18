@@ -1,5 +1,20 @@
 # Chat streaming regression
 
+Open `/tests/browser/readme-screenshots.html?view=chat` for README images with
+the real sidebar, tab strip, `ChatConversation`, composer and context meter.
+`?view=terminal` adds the real `TerminalDock` / xterm view with synthetic PTY
+events; `?view=setup` shows the real SSH setup card. Use a 1200–1512px wide,
+approximately 820px tall viewport. There are no debug controls or JSON panels
+inside the image; a small label identifies all content as demonstration data.
+The setup form starts blank and can be filled with `vps.example.com` / `demo`
+to reveal its simulated first-trust fingerprint card. For the form screenshot,
+use the example key path `/Users/demo/.ssh/id_ed25519` and project directory
+`/home/demo/projects/task-board`; neither path is read from disk.
+Persistent browser storage is replaced before module imports, every native IPC
+is answered in memory, and terminal typing only echoes locally. No real app,
+project, SSH endpoint, key, account or model is accessed. These screenshots show
+production frontend components with demo content, not evidence of a live run.
+
 Open `/tests/browser/ssh-onboarding.html` for the production native SSH setup
 card against an in-memory fake Tauri transport. A fresh form must have empty
 host, user and private-key path, port 22, and remote directory `~`. Use

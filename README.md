@@ -20,6 +20,22 @@ Remote Claude 是一个 macOS 桌面客户端，通过 SSH 连接 Linux VPS，�
 - **用量展示**：分别查看上下文用量，以及支持该查询的 Claude 账号 5 小时和周额度。
 - **首次连接引导**：选择本机私钥、核验服务器指纹、检查远端工具和 Claude 登录状态。
 
+## 界面预览
+
+以下截图来自客户端实际界面组件，项目、会话和终端输出均为演示数据。
+
+**远程项目与对话**
+
+![Remote Claude 的项目列表、会话与聊天界面](docs/screenshots/remote-chat.png)
+
+**窗口底部的 SSH 终端**
+
+![Remote Claude 的集成终端](docs/screenshots/remote-terminal.png)
+
+**首次 SSH 连接配置**
+
+![Remote Claude 的 SSH 主机、密钥与远程目录配置](docs/screenshots/ssh-setup.png)
+
 ## 工作方式
 
 ```text
