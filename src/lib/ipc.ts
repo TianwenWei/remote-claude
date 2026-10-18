@@ -112,6 +112,9 @@ export interface Message {
     questions: QuestionSpec[];
     status: "pending" | "answered" | "dismissed" | "cancelled";
     answers?: Record<string, string | string[]>;
+    /** Native tool approval request; never inferred from AskUserQuestion
+     * input or model-authored option text. */
+    toolPermission?: { toolName: string; inputJson: string };
   };
   /** Image attachments: data URLs render directly, absolute paths load via readFile. */
   images?: string[];
@@ -122,6 +125,12 @@ export interface SessionPage {
   nextBefore: number | null;
   /** Delegation metadata before this page, restored from the session file. */
   subagentHistory: Message[];
+}
+
+export interface CachedRemoteSessionPage {
+  page: SessionPage;
+  /** Local complete-transcript snapshot timestamp, epoch milliseconds. */
+  cachedAt: number;
 }
 
 export interface Workspace {
@@ -142,6 +151,44 @@ export interface Workspace {
    *  ordinary directories. */
   meta?: Record<string, unknown>;
 }
+
+/** A host SSH connection. Authentication is performed by the native SSH
+ * client; the app stores a key path, never private-key contents. */
+export interface SshConnectionInput {
+  host: string;
+  user: string;
+  port: number;
+  identityFile: string | null;
+}
+
+export interface SshConnectionProbe {
+  home: string;
+  claudeAvailable: boolean;
+  claudeVersion: string | null;
+  canonicalPath: string;
+  directories: Array<{ name: string; path: string }>;
+  dependencies: Record<"bash" | "python" | "git" | "claude", {
+    available: boolean;
+    version: string | null;
+  }>;
+  claudeAuth: {
+    status: "authenticated" | "unauthenticated" | "unknown";
+    method: string | null;
+  };
+}
+
+export interface SshHostKeyInspection {
+  status: "known" | "new" | "changed";
+  keys: Array<{ algorithm: string; fingerprint: string }>;
+  knownFingerprints: string[];
+}
+
+export interface SshWorkspaceMeta extends SshConnectionInput {
+  workspace: string;
+  enginePaths: Record<string, string>;
+}
+
+export { sshWorkspaceMetaOf } from "./ssh-workspace";
 
 /** meta.worktree：worktree 子工作区的自描述（分支/来源 PR），由宿主在
  *  创建时写入，侧栏徽标与删除流程读取。 */
@@ -1049,6 +1096,19 @@ export interface UsageRow {
   /** Model responses in this bucket — the request total. */
   requests: number;
 }
+
+export interface ClaudeUsageWindow {
+  usedPercent: number;
+  /** Epoch milliseconds, or null when the service supplies no reset time. */
+  resetsAt: number | null;
+}
+
+export interface ClaudeAccountUsage {
+  plan: string | null;
+  fiveHour: ClaudeUsageWindow | null;
+  sevenDay: ClaudeUsageWindow | null;
+  updatedAt: number;
+}
 // ---- DeepSeek Harness local host ----
 
 /** Snapshot of the DSH local host + CLI probe (`dsh_host_status`,
@@ -1544,6 +1604,13 @@ export const ipc = {
       limit,
       beforeSeq,
     }),
+  /** Local snapshot only: validates the remote route without SSH/network. */
+  loadCachedRemoteSessionPage: (
+    workspacePath: string, engine: string, sessionId: string, remotePath: string,
+    limit?: number, beforeSeq?: number | null,
+  ) => invoke<CachedRemoteSessionPage | null>("load_cached_remote_session_page", {
+    workspacePath, engine, sessionId, remotePath, limit: limit ?? null, beforeSeq: beforeSeq ?? null,
+  }),
   deleteSession: (engine: string, sessionId: string) =>
     invoke<void>("delete_session", { engine, sessionId }),
   /** Remote (plugin-fed, e.g. WSL distro) session delete: no local db row
@@ -1579,6 +1646,20 @@ export const ipc = {
   listWorkspaces: () => invoke<Workspace[]>("list_workspaces"),
   addWorkspace: (path: string, meta?: Record<string, unknown>) =>
     invoke<Workspace>("add_workspace", { path, meta: meta ?? null }),
+  probeSshConnection: (connection: SshConnectionInput, path?: string) =>
+    invoke<SshConnectionProbe>("probe_ssh_connection", { connection, path: path ?? null }),
+  inspectSshHostKey: (host: string, port: number, user?: string) =>
+    invoke<SshHostKeyInspection>("inspect_ssh_host_key", { host, port, user: user ?? null }),
+  trustSshHostKey: (host: string, port: number, expectedFingerprint: string, user?: string) =>
+    invoke<SshHostKeyInspection>("trust_ssh_host_key", { host, port, expectedFingerprint, user: user ?? null }),
+  addSshWorkspace: (connection: SshConnectionInput, path: string) =>
+    invoke<Workspace>("add_ssh_workspace", { connection, path }),
+  createSshWorkspace: (connection: SshConnectionInput, parentPath: string, name: string) =>
+    invoke<Workspace>("create_ssh_workspace", { connection, parentPath, name }),
+  listSshSessions: (workspacePath: string) =>
+    invoke<SessionMeta[]>("list_ssh_sessions", { workspacePath }),
+  claudeAccountUsage: (workspacePath: string, force = false) =>
+    invoke<ClaudeAccountUsage>("claude_account_usage", { workspacePath, force }),
   /** Register a git worktree as a child workspace of `parentId`. The Rust
    *  side validates the parent row exists. */
   addWorktreeWorkspace: (path: string, parentId: string, meta?: Record<string, unknown>) =>

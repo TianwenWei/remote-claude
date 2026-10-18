@@ -19,6 +19,7 @@ export interface EngineEventPayload {
     | "compaction"
     | "permission_denied"
     | "question"
+    | "tool_permission"
     | "question_settled"
     | "done"
     | "model"

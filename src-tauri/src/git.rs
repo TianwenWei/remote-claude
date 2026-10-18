@@ -2,8 +2,11 @@ use git2::{Repository, StatusOptions};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::Path;
+use std::sync::Arc;
 
-#[derive(Debug, Serialize)]
+use crate::files::remote;
+
+#[derive(Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct GitFileEntry {
     pub path: String,
@@ -14,7 +17,7 @@ pub struct GitFileEntry {
     pub deletions: Option<usize>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct GitStatus {
     pub branch: String,
@@ -32,7 +35,7 @@ pub struct GitStatus {
 /// Compact status for a directory that is itself a Git worktree root,
 /// rendered inline in the file tree. Unlike `GitStatus` it carries no file
 /// paths or diff stats — only the branch plus change counts.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RepositorySummary {
     pub path: String,
@@ -58,13 +61,23 @@ pub fn workspace_vcs_metadata(path: &Path) -> Option<WorkspaceVcsMetadata> {
         .as_ref()
         .filter(|_| !repo.head_detached().unwrap_or(false))
         .and_then(|head| head.shorthand().map(str::to_owned));
-    let git_head = head.as_ref().and_then(|head| head.target()).map(|oid| oid.to_string());
+    let git_head = head
+        .as_ref()
+        .and_then(|head| head.target())
+        .map(|oid| oid.to_string());
     let mut opts = StatusOptions::new();
     opts.include_untracked(true).recurse_untracked_dirs(true);
     // Unknown is not clean: a failed status read must not report a spotless
     // worktree. Conservative dirty=true only makes a plugin refresh more.
-    let dirty = repo.statuses(Some(&mut opts)).map(|statuses| !statuses.is_empty()).unwrap_or(true);
-    Some(WorkspaceVcsMetadata { git_branch, git_head, dirty })
+    let dirty = repo
+        .statuses(Some(&mut opts))
+        .map(|statuses| !statuses.is_empty())
+        .unwrap_or(true);
+    Some(WorkspaceVcsMetadata {
+        git_branch,
+        git_head,
+        dirty,
+    })
 }
 
 /// Open `path` only when that directory is itself a worktree root. Standard
@@ -120,6 +133,7 @@ fn repository_summary_cached(
 
 /// Sync body of `git_repository_summaries`: one batch answers one loaded
 /// tree level, so a status walk per candidate stays off the IPC thread.
+#[cfg(test)]
 fn repository_summaries_blocking(paths: Vec<String>) -> Vec<RepositorySummary> {
     paths
         .iter()
@@ -128,11 +142,33 @@ fn repository_summaries_blocking(paths: Vec<String>) -> Vec<RepositorySummary> {
 }
 
 #[tauri::command]
-pub async fn git_repository_summaries(paths: Vec<String>) -> Vec<RepositorySummary> {
-    tauri::async_runtime::spawn_blocking(move || repository_summaries_blocking(paths))
-        .await
-        .unwrap_or_default()
+pub async fn git_repository_summaries(
+    db: tauri::State<'_, Arc<crate::db::Db>>,
+    paths: Vec<String>,
+) -> Result<Vec<RepositorySummary>, String> {
+    let db = Arc::clone(db.inner());
+    tauri::async_runtime::spawn_blocking(move || {
+        let mut summaries = Vec::new();
+        for path in paths {
+            let summary = match remote::call::<Option<RepositorySummary>>(
+                &db,
+                &path,
+                "git_summary",
+                serde_json::json!({}),
+            )? {
+                Some(summary) => summary,
+                None => exact_repository_summary(Path::new(&path)),
+            };
+            if let Some(summary) = summary {
+                summaries.push(summary);
+            }
+        }
+        Ok(summaries)
+    })
+    .await
+    .map_err(|error| error.to_string())?
 }
+
 /// Bulk colors for one loaded tree level. Two sources, merged:
 /// 1. The repo *containing* the listed directory (any depth — the workspace
 ///    root itself, an ancestor, or none). Status paths are repo-relative, so
@@ -237,6 +273,26 @@ fn file_tree_colors_cached(
 
 #[tauri::command]
 pub async fn git_file_colors(
+    db: tauri::State<'_, Arc<crate::db::Db>>,
+    path: String,
+    files: Vec<String>,
+) -> Result<HashMap<String, String>, String> {
+    if crate::engine::wsl_transport::transport_for_path(&db, &path)?.is_none() {
+        return git_file_colors_local(path, files).await;
+    }
+    let db = Arc::clone(db.inner());
+    tauri::async_runtime::spawn_blocking(move || {
+        let args =
+            serde_json::json!({"levels": [{"path": path, "files": files, "directories": files}]});
+        let mut status = remote::call::<GitTreeStatus>(&db, &path, "git_tree", args)?
+            .ok_or_else(|| "remote workspace disappeared".to_string())?;
+        Ok(status.file_colors.remove(&path).unwrap_or_default())
+    })
+    .await
+    .map_err(|error| error.to_string())?
+}
+
+async fn git_file_colors_local(
     path: String,
     files: Vec<String>,
 ) -> Result<HashMap<String, String>, String> {
@@ -299,7 +355,7 @@ impl TreeSnapshots {
     }
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct GitTreeLevel {
     pub path: String,
@@ -307,7 +363,7 @@ pub struct GitTreeLevel {
     pub directories: Vec<String>,
 }
 
-#[derive(Default, Serialize)]
+#[derive(Default, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct GitTreeStatus {
     pub repositories: Vec<RepositorySummary>,
@@ -344,12 +400,36 @@ fn tree_status_blocking(levels: Vec<GitTreeLevel>, snapshots: &mut TreeSnapshots
 }
 
 #[tauri::command]
-pub async fn git_tree_status(levels: Vec<GitTreeLevel>) -> Result<GitTreeStatus, String> {
+pub async fn git_tree_status(
+    db: tauri::State<'_, Arc<crate::db::Db>>,
+    levels: Vec<GitTreeLevel>,
+) -> Result<GitTreeStatus, String> {
+    let db = Arc::clone(db.inner());
     tauri::async_runtime::spawn_blocking(move || {
-        tree_status_blocking(levels, &mut TreeSnapshots::new(true))
+        let mut local = Vec::new();
+        let mut remote_status = GitTreeStatus::default();
+        let mut remote_roots = std::collections::HashSet::new();
+        for level in levels {
+            let args = serde_json::json!({"levels": [&level]});
+            if let Some(status) = remote::call::<GitTreeStatus>(&db, &level.path, "git_tree", args)?
+            {
+                remote_status.file_colors.extend(status.file_colors);
+                for summary in status.repositories {
+                    if remote_roots.insert(summary.path.clone()) {
+                        remote_status.repositories.push(summary);
+                    }
+                }
+            } else {
+                local.push(level);
+            }
+        }
+        let mut result = tree_status_blocking(local, &mut TreeSnapshots::new(true));
+        result.file_colors.extend(remote_status.file_colors);
+        result.repositories.extend(remote_status.repositories);
+        Ok(result)
     })
     .await
-    .map_err(|error| error.to_string())
+    .map_err(|error| error.to_string())?
 }
 
 pub(crate) fn open_repo(path: &str) -> Result<Repository, String> {
@@ -622,10 +702,19 @@ fn git_status_blocking(path: &str) -> Result<GitStatus, String> {
 }
 
 #[tauri::command]
-pub async fn git_status(path: String) -> Result<GitStatus, String> {
-    tauri::async_runtime::spawn_blocking(move || git_status_blocking(&path))
-        .await
-        .map_err(|e| e.to_string())?
+pub async fn git_status(
+    db: tauri::State<'_, Arc<crate::db::Db>>,
+    path: String,
+) -> Result<GitStatus, String> {
+    let db = Arc::clone(db.inner());
+    tauri::async_runtime::spawn_blocking(move || {
+        if let Some(value) = remote::call(&db, &path, "git_status", serde_json::json!({}))? {
+            return Ok(value);
+        }
+        git_status_blocking(&path)
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 /// Hard cap on the patch text handed to the frontend — with untracked content
@@ -689,14 +778,49 @@ fn git_diff_blocking(path: &str, file: &str, staged: bool) -> Result<String, Str
 }
 
 #[tauri::command]
-pub async fn git_diff(path: String, file: String, staged: bool) -> Result<String, String> {
-    tauri::async_runtime::spawn_blocking(move || git_diff_blocking(&path, &file, staged))
-        .await
-        .map_err(|e| e.to_string())?
+pub async fn git_diff(
+    db: tauri::State<'_, Arc<crate::db::Db>>,
+    path: String,
+    file: String,
+    staged: bool,
+) -> Result<String, String> {
+    let db = Arc::clone(db.inner());
+    tauri::async_runtime::spawn_blocking(move || {
+        if let Some(value) = remote::call(
+            &db,
+            &path,
+            "git_diff",
+            serde_json::json!({"file": file, "staged": staged}),
+        )? {
+            return Ok(value);
+        }
+        git_diff_blocking(&path, &file, staged)
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 #[tauri::command]
-pub fn git_stage(path: String, files: Vec<String>) -> Result<(), String> {
+pub async fn git_stage(
+    db: tauri::State<'_, Arc<crate::db::Db>>,
+    path: String,
+    files: Vec<String>,
+) -> Result<(), String> {
+    let db = Arc::clone(db.inner());
+    tauri::async_runtime::spawn_blocking(move || git_stage_blocking(&db, path, files))
+        .await
+        .map_err(|error| error.to_string())?
+}
+
+fn git_stage_blocking(db: &crate::db::Db, path: String, files: Vec<String>) -> Result<(), String> {
+    if let Some(value) = remote::call(&db, &path, "git_stage", serde_json::json!({"files": files}))?
+    {
+        return Ok(value);
+    }
+    git_stage_local(path, files)
+}
+
+fn git_stage_local(path: String, files: Vec<String>) -> Result<(), String> {
     let repo = open_repo(&path)?;
     let mut index = repo.index().map_err(|e| e.to_string())?;
     for file in &files {
@@ -716,7 +840,34 @@ pub fn git_stage(path: String, files: Vec<String>) -> Result<(), String> {
 }
 
 #[tauri::command]
-pub fn git_unstage(path: String, files: Vec<String>) -> Result<(), String> {
+pub async fn git_unstage(
+    db: tauri::State<'_, Arc<crate::db::Db>>,
+    path: String,
+    files: Vec<String>,
+) -> Result<(), String> {
+    let db = Arc::clone(db.inner());
+    tauri::async_runtime::spawn_blocking(move || git_unstage_blocking(&db, path, files))
+        .await
+        .map_err(|error| error.to_string())?
+}
+
+fn git_unstage_blocking(
+    db: &crate::db::Db,
+    path: String,
+    files: Vec<String>,
+) -> Result<(), String> {
+    if let Some(value) = remote::call(
+        &db,
+        &path,
+        "git_unstage",
+        serde_json::json!({"files": files}),
+    )? {
+        return Ok(value);
+    }
+    git_unstage_local(path, files)
+}
+
+fn git_unstage_local(path: String, files: Vec<String>) -> Result<(), String> {
     let repo = open_repo(&path)?;
     let head = repo.head().and_then(|h| h.peel_to_commit());
     let mut index = repo.index().map_err(|e| e.to_string())?;
@@ -767,7 +918,34 @@ pub fn git_unstage(path: String, files: Vec<String>) -> Result<(), String> {
 /// untracked path is deleted from disk. Staged deletions (in HEAD, removed
 /// from the index) are not offered discard in the UI; here they are a no-op.
 #[tauri::command]
-pub fn git_discard(path: String, files: Vec<String>) -> Result<(), String> {
+pub async fn git_discard(
+    db: tauri::State<'_, Arc<crate::db::Db>>,
+    path: String,
+    files: Vec<String>,
+) -> Result<(), String> {
+    let db = Arc::clone(db.inner());
+    tauri::async_runtime::spawn_blocking(move || git_discard_blocking(&db, path, files))
+        .await
+        .map_err(|error| error.to_string())?
+}
+
+fn git_discard_blocking(
+    db: &crate::db::Db,
+    path: String,
+    files: Vec<String>,
+) -> Result<(), String> {
+    if let Some(value) = remote::call(
+        &db,
+        &path,
+        "git_discard",
+        serde_json::json!({"files": files}),
+    )? {
+        return Ok(value);
+    }
+    git_discard_local(path, files)
+}
+
+fn git_discard_local(path: String, files: Vec<String>) -> Result<(), String> {
     let repo = open_repo(&path)?;
     let workdir = repo
         .workdir()
@@ -793,7 +971,34 @@ pub fn git_discard(path: String, files: Vec<String>) -> Result<(), String> {
 }
 
 #[tauri::command]
-pub fn git_commit(path: String, message: String) -> Result<String, String> {
+pub async fn git_commit(
+    db: tauri::State<'_, Arc<crate::db::Db>>,
+    path: String,
+    message: String,
+) -> Result<String, String> {
+    let db = Arc::clone(db.inner());
+    tauri::async_runtime::spawn_blocking(move || git_commit_blocking(&db, path, message))
+        .await
+        .map_err(|error| error.to_string())?
+}
+
+fn git_commit_blocking(
+    db: &crate::db::Db,
+    path: String,
+    message: String,
+) -> Result<String, String> {
+    if let Some(value) = remote::call(
+        &db,
+        &path,
+        "git_commit",
+        serde_json::json!({"message": message}),
+    )? {
+        return Ok(value);
+    }
+    git_commit_local(path, message)
+}
+
+fn git_commit_local(path: String, message: String) -> Result<String, String> {
     let trimmed = message.trim();
     if trimmed.is_empty() {
         return Err("empty commit message".to_string());
@@ -975,7 +1180,19 @@ fn fetch_options(config: git2::Config) -> git2::FetchOptions<'static> {
 }
 
 #[tauri::command]
-pub async fn git_push(path: String) -> Result<(), String> {
+pub async fn git_push(
+    db: tauri::State<'_, Arc<crate::db::Db>>,
+    path: String,
+) -> Result<(), String> {
+    if crate::engine::wsl_transport::transport_for_path(&db, &path)?.is_some() {
+        let db = Arc::clone(db.inner());
+        return tauri::async_runtime::spawn_blocking(move || {
+            remote::call::<()>(&db, &path, "git_push", serde_json::json!({}))?
+                .ok_or_else(|| "remote workspace disappeared".to_string())
+        })
+        .await
+        .map_err(|e| e.to_string())?;
+    }
     tauri::async_runtime::spawn_blocking(move || {
         let repo = open_repo(&path)?;
         let branch = current_branch_name(&repo)?;
@@ -1099,7 +1316,19 @@ fn git_pull_blocking(path: &str) -> Result<(), String> {
 }
 
 #[tauri::command]
-pub async fn git_pull(path: String) -> Result<(), String> {
+pub async fn git_pull(
+    db: tauri::State<'_, Arc<crate::db::Db>>,
+    path: String,
+) -> Result<(), String> {
+    if crate::engine::wsl_transport::transport_for_path(&db, &path)?.is_some() {
+        let db = Arc::clone(db.inner());
+        return tauri::async_runtime::spawn_blocking(move || {
+            remote::call::<()>(&db, &path, "git_pull", serde_json::json!({}))?
+                .ok_or_else(|| "remote workspace disappeared".to_string())
+        })
+        .await
+        .map_err(|e| e.to_string())?;
+    }
     tauri::async_runtime::spawn_blocking(move || git_pull_blocking(&path))
         .await
         .map_err(|e| e.to_string())?
@@ -1113,7 +1342,7 @@ fn current_branch_name(repo: &Repository) -> Result<String, String> {
         .ok_or_else(|| "detached HEAD".to_string())
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct BranchInfo {
     pub name: String,
@@ -1123,7 +1352,24 @@ pub struct BranchInfo {
 }
 
 #[tauri::command]
-pub fn git_branches(path: String) -> Result<Vec<BranchInfo>, String> {
+pub async fn git_branches(
+    db: tauri::State<'_, Arc<crate::db::Db>>,
+    path: String,
+) -> Result<Vec<BranchInfo>, String> {
+    let db = Arc::clone(db.inner());
+    tauri::async_runtime::spawn_blocking(move || git_branches_blocking(&db, path))
+        .await
+        .map_err(|error| error.to_string())?
+}
+
+fn git_branches_blocking(db: &crate::db::Db, path: String) -> Result<Vec<BranchInfo>, String> {
+    if let Some(value) = remote::call(&db, &path, "git_branches", serde_json::json!({}))? {
+        return Ok(value);
+    }
+    git_branches_local(path)
+}
+
+fn git_branches_local(path: String) -> Result<Vec<BranchInfo>, String> {
     let repo = open_repo(&path)?;
     // No is_current flag: consumers compare against the live status branch —
     // a cached flag here goes stale on external (CLI) checkouts.
@@ -1184,10 +1430,7 @@ fn checkout_remote_branch(
     if remote.get().target().is_none() {
         return Err(format!("{remote_shorthand} is not a branch"));
     }
-    let target = remote
-        .get()
-        .peel_to_commit()
-        .map_err(|e| e.to_string())?;
+    let target = remote.get().peel_to_commit().map_err(|e| e.to_string())?;
     let local_name = local_name_for_remote_branch(repo, remote_shorthand)
         .ok_or_else(|| format!("no remote matches {remote_shorthand}"))?;
     let (mut local, created) = match repo.find_branch(&local_name, git2::BranchType::Local) {
@@ -1223,7 +1466,30 @@ fn checkout_remote_branch(
 }
 
 #[tauri::command]
-pub fn git_checkout(path: String, branch: String) -> Result<(), String> {
+pub async fn git_checkout(
+    db: tauri::State<'_, Arc<crate::db::Db>>,
+    path: String,
+    branch: String,
+) -> Result<(), String> {
+    let db = Arc::clone(db.inner());
+    tauri::async_runtime::spawn_blocking(move || git_checkout_blocking(&db, path, branch))
+        .await
+        .map_err(|error| error.to_string())?
+}
+
+fn git_checkout_blocking(db: &crate::db::Db, path: String, branch: String) -> Result<(), String> {
+    if let Some(value) = remote::call(
+        &db,
+        &path,
+        "git_checkout",
+        serde_json::json!({"branch": branch}),
+    )? {
+        return Ok(value);
+    }
+    git_checkout_local(path, branch)
+}
+
+fn git_checkout_local(path: String, branch: String) -> Result<(), String> {
     let repo = open_repo(&path)?;
     // A remote-tracking branch never receives HEAD directly (that would
     // detach it): it is materialized as a local tracking branch instead.
@@ -1249,7 +1515,34 @@ pub fn git_checkout(path: String, branch: String) -> Result<(), String> {
 }
 
 #[tauri::command]
-pub fn git_create_branch(path: String, name: String) -> Result<(), String> {
+pub async fn git_create_branch(
+    db: tauri::State<'_, Arc<crate::db::Db>>,
+    path: String,
+    name: String,
+) -> Result<(), String> {
+    let db = Arc::clone(db.inner());
+    tauri::async_runtime::spawn_blocking(move || git_create_branch_blocking(&db, path, name))
+        .await
+        .map_err(|error| error.to_string())?
+}
+
+fn git_create_branch_blocking(
+    db: &crate::db::Db,
+    path: String,
+    name: String,
+) -> Result<(), String> {
+    if let Some(value) = remote::call(
+        &db,
+        &path,
+        "git_create_branch",
+        serde_json::json!({"name": name}),
+    )? {
+        return Ok(value);
+    }
+    git_create_branch_local(path, name)
+}
+
+fn git_create_branch_local(path: String, name: String) -> Result<(), String> {
     let trimmed = name.trim();
     if trimmed.is_empty() {
         return Err("empty branch name".to_string());
@@ -1325,7 +1618,8 @@ mod tests {
     fn canonical_remote_url_rewrites_and_restores() {
         let scratch = Scratch::new();
         let repo = Repository::init(&scratch.0).unwrap();
-        repo.remote("origin", "http://host:8000/owner/repo").unwrap();
+        repo.remote("origin", "http://host:8000/owner/repo")
+            .unwrap();
 
         {
             let _guard = CanonicalRemoteUrl::new(&repo).unwrap();
@@ -1562,7 +1856,7 @@ mod tests {
         let scratch = Scratch::new();
         let nested = scratch.0.join("nested");
         Repository::init(&nested).unwrap();
-        let colors = tauri::async_runtime::block_on(git_file_colors(
+        let colors = tauri::async_runtime::block_on(git_file_colors_local(
             scratch.0.to_string_lossy().into_owned(),
             vec!["nested".to_string(), "plain.txt".to_string()],
         ))
@@ -1739,7 +2033,10 @@ mod tests {
         // written until autocrlf is pinned off just below.
         builder.with_checkout(git2::build::CheckoutBuilder::new());
         let repo = builder.clone(origin_url, into).unwrap();
-        repo.config().unwrap().set_bool("core.autocrlf", false).unwrap();
+        repo.config()
+            .unwrap()
+            .set_bool("core.autocrlf", false)
+            .unwrap();
         let mut checkout = git2::build::CheckoutBuilder::new();
         checkout.force();
         repo.checkout_head(Some(&mut checkout)).unwrap();
@@ -2091,7 +2388,7 @@ mod tests {
             .reference_symbolic("refs/remotes/origin/HEAD", &remote_head, true, "test")
             .unwrap();
 
-        let branches = git_branches(local_path.to_string_lossy().into_owned()).unwrap();
+        let branches = git_branches_local(local_path.to_string_lossy().into_owned()).unwrap();
         let names: Vec<&str> = branches.iter().map(|b| b.name.as_str()).collect();
         assert!(names.contains(&"origin/v1.0.9"), "names={names:?}");
         assert!(!names.contains(&"origin/HEAD"), "names={names:?}");
@@ -2119,7 +2416,7 @@ mod tests {
         let local_path = scratch.0.join("local");
         let local = Repository::clone(origin_path.to_str().unwrap(), &local_path).unwrap();
 
-        git_checkout(
+        git_checkout_local(
             local_path.to_string_lossy().into_owned(),
             "origin/v1.0.9".to_string(),
         )
@@ -2128,14 +2425,20 @@ mod tests {
         let head_ref = local.head().unwrap();
         assert_eq!(head_ref.shorthand(), Some("v1.0.9"));
         assert_eq!(head_ref.target(), Some(head.id()));
-        let branch = local.find_branch("v1.0.9", git2::BranchType::Local).unwrap();
+        let branch = local
+            .find_branch("v1.0.9", git2::BranchType::Local)
+            .unwrap();
         assert_eq!(
             branch.upstream().unwrap().name().unwrap(),
             Some("origin/v1.0.9")
         );
         // Tracking makes ahead/behind visible (0/0) instead of hidden.
         let status = git_status_blocking(local_path.to_str().unwrap()).unwrap();
-        assert_eq!((status.ahead, status.behind), (Some(0), Some(0)), "{status:?}");
+        assert_eq!(
+            (status.ahead, status.behind),
+            (Some(0), Some(0)),
+            "{status:?}"
+        );
     }
 
     #[test]
@@ -2163,7 +2466,7 @@ mod tests {
         let local_tip = local.head().unwrap().target().unwrap();
         assert_ne!(local_tip, base.id());
 
-        git_checkout(
+        git_checkout_local(
             local_path.to_string_lossy().into_owned(),
             "origin/feature".to_string(),
         )
@@ -2172,7 +2475,9 @@ mod tests {
         assert_eq!(local.head().unwrap().target(), Some(local_tip));
         assert!(local_path.join("local.txt").exists());
         // Only switched: no upstream was invented for the existing branch.
-        let branch = local.find_branch("feature", git2::BranchType::Local).unwrap();
+        let branch = local
+            .find_branch("feature", git2::BranchType::Local)
+            .unwrap();
         assert!(branch.upstream().is_err());
     }
 
@@ -2201,7 +2506,7 @@ mod tests {
                 .id;
             std::fs::write(scratch.0.join("a.txt"), "unstaged\n").unwrap();
 
-            git_discard(
+            git_discard_local(
                 scratch.0.to_string_lossy().into_owned(),
                 vec!["a.txt".to_string()],
             )
@@ -2237,7 +2542,7 @@ mod tests {
             let staged_tree = repo.index().unwrap().write_tree().unwrap();
             std::fs::remove_file(scratch.0.join("a.txt")).unwrap();
 
-            git_discard(
+            git_discard_local(
                 scratch.0.to_string_lossy().into_owned(),
                 vec!["a.txt".to_string()],
             )
@@ -2270,7 +2575,7 @@ mod tests {
             }
             let staged_tree = repo.index().unwrap().write_tree().unwrap();
 
-            git_discard(
+            git_discard_local(
                 scratch.0.to_string_lossy().into_owned(),
                 vec!["new.txt".to_string()],
             )
@@ -2292,7 +2597,7 @@ mod tests {
         std::fs::create_dir_all(scratch.0.join("sub")).unwrap();
         std::fs::write(scratch.0.join("sub/new.txt"), "x\n").unwrap();
 
-        git_discard(
+        git_discard_local(
             scratch.0.to_string_lossy().into_owned(),
             vec!["sub/new.txt".to_string()],
         )

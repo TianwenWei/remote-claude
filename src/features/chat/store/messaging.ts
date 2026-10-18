@@ -1,4 +1,6 @@
 import { ipc } from "@/lib/ipc";
+import { sshWorkspaceMetaOf } from "@/lib/ssh-workspace";
+import { isToolPermissionAnswer } from "@/lib/tool-permission";
 import { errorText } from "@/lib/errors";
 import { newId } from "@/lib/id";
 import i18n from "@/lib/i18n";
@@ -177,10 +179,12 @@ export function createMessagingActions(
     // exact text, so editing the bot mid-conversation cannot change a prompt
     // the model has already been primed with (and the prefix cache holds).
     const selectedBot = getSelectedBot(tab.workspacePath, tab.sessionId);
+    const sshWorkspace = sshWorkspaceMetaOf(get().workspaces?.find((workspace) => workspace.path === tab.workspacePath));
     // 记忆工具每次发送都要重新挂载（每次发送都是一个新进程）；冻结的只是
     // 提示词。能挂的条件：选中了自定义 Bot、它开着记忆、这个引擎支持 MCP。
     const pinnedBot = selectedBot ? botById(selectedBot.id) : null;
     const memoryToolAvailable =
+      !sshWorkspace &&
       pinnedBot !== null &&
       pinnedBot.memory.enabled !== false &&
       engineSupportsMemory(get().engines, tab.engine);
@@ -229,8 +233,8 @@ export function createMessagingActions(
     // Computer use asks for the driver; engines without an MCP-mount path
     // would run the prompt text-only while the user believes the machine is
     // under agent control. Refuse loudly instead of downgrading silently.
-    if (options?.computerUse && !engineSupportsComputerUse(get().engines, engine)) {
-      patchSession(set, key, { error: i18n.t("chat.cuaUnsupportedEngine") });
+    if (options?.computerUse && (sshWorkspace || !engineSupportsComputerUse(get().engines, engine))) {
+      patchSession(set, key, { error: i18n.t(sshWorkspace ? "chat.cuaRemoteUnsupported" : "chat.cuaUnsupportedEngine") });
       return;
     }
     // Resolve BEFORE the optimistic rows land: the patch below writes
@@ -808,10 +812,14 @@ export function createMessagingActions(
       ) {
         return;
       }
+      if (question.toolPermission && !isToolPermissionAnswer(answers)) {
+        patchSession(set, key, { error: i18n.t("chat.toolPermissionInvalidChoice") });
+        return;
+      }
       // A multi-select round is answered through the CLI's free-form row, whose
       // editor then carries the picked labels: replying to the select frame with
       // a label only toggles the CLI's own set and re-asks the same question.
-      const loop = answers ? beginAskSubmit(key, seq, answerText(answers)) : undefined;
+      const loop = answers && !question.toolPermission ? beginAskSubmit(key, seq, answerText(answers)) : undefined;
       try {
         await ipc.answerQuestion(
           question.runId,

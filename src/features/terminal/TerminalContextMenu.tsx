@@ -7,6 +7,8 @@ import { copyText } from "@/lib/clipboard";
 import { isPathUnder, pathExistsOnDisk } from "@/features/chat/file-link-resolution";
 import { resolveFilePath } from "@/lib/fileLinks";
 import { ipc } from "@/lib/ipc";
+import { useChatStore } from "@/features/chat/store";
+import { isSshWorkspacePath } from "@/lib/ssh-workspace";
 
 export interface TerminalMenuState {
   x: number;
@@ -37,6 +39,7 @@ export function TerminalContextMenu({
   onClose: () => void;
 }) {
   const { t } = useTranslation();
+  const remote = useChatStore((state) => isSshWorkspacePath(state.workspaces, cwd));
 
   const isMac = navigator.platform.includes("Mac");
   const isWindows = navigator.platform.includes("Win");
@@ -54,7 +57,7 @@ export function TerminalContextMenu({
   useEffect(() => {
     let cancelled = false;
     setExists(null);
-    if (resolved) {
+    if (resolved && !remote) {
       if (!isPathUnder(resolved, cwd)) {
         // Outside the workspace the probe itself would pop a grant dialog;
         // the explicit click is consent enough, so enable on the raw path.
@@ -72,7 +75,7 @@ export function TerminalContextMenu({
     return () => {
       cancelled = true;
     };
-  }, [resolved, cwd]);
+  }, [resolved, cwd, remote]);
 
   const entries: ContextMenuEntry[] = [
     {
@@ -84,7 +87,7 @@ export function TerminalContextMenu({
       },
     },
   ];
-  if (resolved) {
+  if (resolved && !remote) {
     entries.push({
       id: "reveal",
       label: revealLabel,

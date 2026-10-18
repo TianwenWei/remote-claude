@@ -5,6 +5,11 @@ description = "CC GUI - multi-CLI AI chat desktop"
 edition = "2021"
 rust-version = "1.77.2"
 
+[features]
+# Separate profile for the locally built SSH client; never reuse the installed
+# desktop application's provider credentials or SQLite database.
+remote-vps = []
+
 [lib]
 name = "ccgui_next_lib"
 crate-type = ["staticlib", "cdylib", "rlib"]
@@ -42,6 +47,7 @@ uuid = { version = "1", features = ["v4"] }
 parking_lot = "0.12"
 fs2 = "0.4.3"
 base64 = "0.22"
+flate2 = "1"
 zstd = "0.13"
 which = "7"
 # PTY for the integrated terminal panel.

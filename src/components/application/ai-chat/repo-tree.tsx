@@ -336,17 +336,24 @@ function RepoHeaderRow({
         type="button"
         aria-expanded={expanded}
         onClick={onToggleOpen}
-        className="flex min-w-0 flex-1 cursor-pointer items-center text-left"
+        className="flex min-w-0 flex-1 cursor-pointer flex-col items-stretch text-left"
       >
-        <span
-          title={repo.originalLabel}
-          className="truncate text-body-2-medium whitespace-nowrap text-text-secondary"
-        >
-          {repo.label}
+        <span className="flex min-w-0 items-center">
+          <span
+            title={repo.originalLabel ?? repo.label}
+            className="min-w-0 truncate text-body-2-medium whitespace-nowrap text-text-secondary"
+          >
+            {repo.label}
+          </span>
+          {repo.labelSuffix && (
+            <span className="ws-label-badge ml-1.5 shrink-0">
+              {repo.labelSuffix}
+            </span>
+          )}
         </span>
-        {repo.labelSuffix && (
-          <span className="ws-label-badge ml-1.5 shrink-0">
-            {repo.labelSuffix}
+        {repo.labelDescription && (
+          <span title={repo.labelDescription} className="truncate text-caption-2-regular text-text-tertiary">
+            {repo.labelDescription}
           </span>
         )}
       </button>

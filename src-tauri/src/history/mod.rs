@@ -3,6 +3,7 @@ mod codex_titles;
 pub(crate) mod discovery;
 mod extract;
 pub mod reader;
+mod remote_cache;
 pub mod scanner;
 pub mod search;
 

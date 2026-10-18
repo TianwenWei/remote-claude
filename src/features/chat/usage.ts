@@ -102,6 +102,12 @@ export function mergeUsage(next: unknown, prev: unknown): unknown {
   const nextObj = asRecord(next);
   const prevObj = asRecord(prev);
   if (!nextObj || !prevObj) return next;
+  // Empty/zero placeholders carry no occupancy. Preserve the last real
+  // snapshot, while still accepting capacity metadata reported on its own.
+  if (!parseUsage(nextObj) && parseUsage(prevObj)) {
+    const nextWindow = reportedContextWindow(nextObj);
+    return nextWindow ? { ...prevObj, model_context_window: nextWindow } : prev;
+  }
   if (reportedContextWindow(nextObj)) return next;
   const window = reportedContextWindow(prevObj);
   if (!window) return next;

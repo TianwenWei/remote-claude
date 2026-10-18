@@ -85,6 +85,8 @@ export interface AgentLimitsCardProps {
     /** Window size in tokens (e.g. 1_000_000). */
     max: number;
     segments: ContextSegment[];
+    /** Missing usage must not be rendered as zero used / all free. */
+    known?: boolean;
     groups?: ContextGroup[];
   };
   /** Plan name shown after "Plan usage limits ·". */
@@ -97,6 +99,7 @@ export interface AgentLimitsCardProps {
   /** Copy, already localized by the caller (i18n lives in feature code). */
   text: {
     contextWindow: string;
+    contextUsageUnknown?: string;
     freeSpace: string;
     planUsageLimits: string;
     /** aria-label for the plan link arrow (rendered only with `planHref`). */
@@ -151,12 +154,14 @@ function ContextHeader({
   label,
   used,
   max,
+  known,
   expanded,
   onToggle,
 }: {
   label: string;
   used: number;
   max: number;
+  known: boolean;
   expanded: boolean;
   onToggle: () => void;
 }) {
@@ -170,8 +175,8 @@ function ContextHeader({
       <span className="text-body-medium text-text-secondary">{label}</span>
       <span className="flex items-center gap-2">
         <span className="text-body-medium whitespace-nowrap text-text-secondary tabular-nums">
-          {formatTokens(used)} / {formatTokens(max)}{" "}
-          <span className="text-text-primary">({Math.round(shareOf(used, max))}%)</span>
+          {known ? formatTokens(used) : "—"} / {formatTokens(max)}{" "}
+          {known && <span className="text-text-primary">({Math.round(shareOf(used, max))}%)</span>}
         </span>
         <ChevronDown
           className={cx(
@@ -632,12 +637,13 @@ export function AgentLimitsCard({
         label={text.contextWindow}
         used={used}
         max={context.max}
+        known={context.known !== false}
         expanded={expanded}
         onToggle={toggle}
       />
 
       <Bar className="mt-1.5">
-        {context.segments.map((s, i) =>
+        {context.known !== false && context.segments.map((s, i) =>
           s.deferred ? null : (
             <div
               key={s.label}
@@ -649,6 +655,10 @@ export function AgentLimitsCard({
         )}
       </Bar>
 
+      {context.known === false && text.contextUsageUnknown && (
+        <p role="status" className="mt-2 text-caption-1-regular text-text-tertiary">{text.contextUsageUnknown}</p>
+      )}
+
       <Collapsible
         open={expanded}
         seconds={0.32}
@@ -657,7 +667,7 @@ export function AgentLimitsCard({
         // that gutter and keep their rounded corners.
         innerClassName="-mx-2 px-2"
       >
-        <SegmentLegend
+        {context.known !== false && <SegmentLegend
           segments={context.segments}
           tones={tones}
           max={context.max}
@@ -666,7 +676,7 @@ export function AgentLimitsCard({
           groups={context.groups}
           openGroups={openGroups}
           onToggleGroup={toggleGroup}
-        />
+        />}
       </Collapsible>
 
       {/* ---------------------------------------------- actions: compact & refresh */}

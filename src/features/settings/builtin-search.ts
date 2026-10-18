@@ -318,6 +318,7 @@ const workspaceEntries: SettingsSearchEntry[] = [
     labelKey: "settings.workspaceGroups",
   },
   { page: "workspaces", anchor: "projects", labelKey: "settings.projects" },
+  ...(isWeb ? [] : [{ page: "workspaces", anchor: "sshWorkspaces", labelKey: "settings.sshWorkspaces", keywords: ["SSH", "remote", "VPS", "远程", "新建项目", "创建目录", "new project", "create directory"] } satisfies SettingsSearchEntry]),
   ...(isWeb
     ? []
     : [

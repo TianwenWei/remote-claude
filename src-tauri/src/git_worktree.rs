@@ -259,9 +259,7 @@ pub fn parse_worktree_porcelain(text: &str) -> Vec<WorktreeInfo> {
 fn same_path(a: &str, b: &str) -> bool {
     match (std::fs::canonicalize(a), std::fs::canonicalize(b)) {
         (Ok(x), Ok(y)) => x == y,
-        _ => {
-            a.trim_end_matches(['/', '\\']) == b.trim_end_matches(['/', '\\'])
-        }
+        _ => a.trim_end_matches(['/', '\\']) == b.trim_end_matches(['/', '\\']),
     }
 }
 
@@ -343,7 +341,14 @@ async fn run_git(
 
     let stdout = String::from_utf8_lossy(&out_task.await.map_err(|e| e.to_string())?).into_owned();
     let stderr = String::from_utf8_lossy(&err_task.await.map_err(|e| e.to_string())?).into_owned();
-    Ok((GitOutput { stdout, stderr, status }, cancelled))
+    Ok((
+        GitOutput {
+            stdout,
+            stderr,
+            status,
+        },
+        cancelled,
+    ))
 }
 
 // ---------------------------------------------------------------------------
@@ -454,8 +459,12 @@ async fn run_create(
 
     // ---- validate ----------------------------------------------------------
     emit_progress(app, creation_id, "validate", None, None, None);
-    let repo = crate::git::open_repo(&args.repo_path)
-        .map_err(|_| fail("not_a_repo", format!("{} is not a git repository", args.repo_path)))?;
+    let repo = crate::git::open_repo(&args.repo_path).map_err(|_| {
+        fail(
+            "not_a_repo",
+            format!("{} is not a git repository", args.repo_path),
+        )
+    })?;
 
     let fmt = run_git(
         &repo_path,
@@ -518,7 +527,10 @@ async fn run_create(
         {
             return Err(fail(
                 "branch_checked_out",
-                format!("branch {} is already checked out in another worktree", args.branch),
+                format!(
+                    "branch {} is already checked out in another worktree",
+                    args.branch
+                ),
             ));
         }
     }
@@ -552,7 +564,14 @@ async fn run_create(
         // Refresh the remote-tracking base when there is one; a failed fetch
         // only blocks creation when the base doesn't resolve locally at all.
         if let Some((remote, rest)) = split_remote(&repo, base) {
-            emit_progress(app, creation_id, "fetch", Some(base.to_string()), None, None);
+            emit_progress(
+                app,
+                creation_id,
+                "fetch",
+                Some(base.to_string()),
+                None,
+                None,
+            );
             let (_, cancelled) = run_git(&repo_path, &["fetch", remote, rest], Some(cancel))
                 .await
                 .map_err(|e| fail("unknown", e))?;
@@ -578,7 +597,14 @@ async fn run_create(
 
     // ---- add ---------------------------------------------------------------
     if !resume {
-        emit_progress(app, creation_id, "add", Some(args.branch.clone()), None, None);
+        emit_progress(
+            app,
+            creation_id,
+            "add",
+            Some(args.branch.clone()),
+            None,
+            None,
+        );
         let add_args: Vec<&str> = if args.existing_branch || args.pr_number.is_some() {
             vec!["worktree", "add", &args.worktree_path, &args.branch]
         } else {
@@ -668,8 +694,28 @@ async fn run_create(
 // Commands
 // ---------------------------------------------------------------------------
 
+fn require_local_worktree(db: &crate::db::Db, paths: &[&str]) -> Result<(), String> {
+    for path in paths {
+        if crate::engine::wsl_transport::transport_for_path(db, path)?.is_some() {
+            return Err(
+                "Worktree management is unavailable for SSH workspaces; use the remote terminal"
+                    .into(),
+            );
+        }
+    }
+    Ok(())
+}
+
 #[tauri::command]
-pub async fn git_worktree_list(repo_path: String) -> Result<Vec<WorktreeInfo>, String> {
+pub async fn git_worktree_list(
+    db: tauri::State<'_, Arc<crate::db::Db>>,
+    repo_path: String,
+) -> Result<Vec<WorktreeInfo>, String> {
+    require_local_worktree(&db, &[&repo_path])?;
+    git_worktree_list_inner(repo_path).await
+}
+
+async fn git_worktree_list_inner(repo_path: String) -> Result<Vec<WorktreeInfo>, String> {
     crate::git::open_repo(&repo_path)?;
     list_worktrees_cli(&PathBuf::from(repo_path)).await
 }
@@ -681,6 +727,7 @@ pub async fn git_worktree_create(
     creation_id: String,
     args: WorktreeCreateArgs,
 ) -> Result<(), String> {
+    require_local_worktree(&state.db, &[&args.repo_path, &args.worktree_path])?;
     let id = creation_id.trim().to_string();
     if id.is_empty() {
         return Err("empty creation_id".to_string());
@@ -695,7 +742,14 @@ pub async fn git_worktree_create(
             Ok(())
         }
         Err(f) => {
-            emit_progress(Some(&app), &id, "failed", None, Some(f.kind), Some(f.message.clone()));
+            emit_progress(
+                Some(&app),
+                &id,
+                "failed",
+                None,
+                Some(f.kind),
+                Some(f.message.clone()),
+            );
             Err(f.message)
         }
     }
@@ -713,6 +767,17 @@ pub fn git_worktree_create_cancel(
 
 #[tauri::command]
 pub async fn git_worktree_remove(
+    db: tauri::State<'_, Arc<crate::db::Db>>,
+    repo_path: String,
+    worktree_path: String,
+    branch: Option<String>,
+    delete_branch: bool,
+) -> Result<WorktreeRemoveResult, String> {
+    require_local_worktree(&db, &[&repo_path, &worktree_path])?;
+    git_worktree_remove_inner(repo_path, worktree_path, branch, delete_branch).await
+}
+
+async fn git_worktree_remove_inner(
     repo_path: String,
     worktree_path: String,
     branch: Option<String>,
@@ -757,13 +822,11 @@ pub async fn git_worktree_remove(
                 if hard.status.success() {
                     branch_deleted = true;
                 } else {
-                    branch_kept_reason = Some(
-                        if hard.stderr.contains("checked out") {
-                            "checked_out_elsewhere"
-                        } else {
-                            "unknown"
-                        },
-                    );
+                    branch_kept_reason = Some(if hard.stderr.contains("checked out") {
+                        "checked_out_elsewhere"
+                    } else {
+                        "unknown"
+                    });
                 }
             }
         }
@@ -780,6 +843,16 @@ pub async fn git_worktree_remove(
 /// Squash merges report false — the UI wording says so.
 #[tauri::command]
 pub async fn git_branch_merged(
+    db: tauri::State<'_, Arc<crate::db::Db>>,
+    repo_path: String,
+    branch: String,
+    base: String,
+) -> Result<bool, String> {
+    require_local_worktree(&db, &[&repo_path])?;
+    git_branch_merged_inner(repo_path, branch, base).await
+}
+
+async fn git_branch_merged_inner(
     repo_path: String,
     branch: String,
     base: String,
@@ -854,6 +927,17 @@ async fn gh_pr_view(number: u64, repo_slug: &str) -> Option<GhPrView> {
 /// not_a_repo | no_origin | not_github.
 #[tauri::command]
 pub async fn git_resolve_pr(
+    db: tauri::State<'_, Arc<crate::db::Db>>,
+    repo_path: String,
+    input: String,
+    suggested_branch: String,
+    worktree_path: String,
+) -> Result<PrPreview, String> {
+    require_local_worktree(&db, &[&repo_path, &worktree_path])?;
+    git_resolve_pr_inner(repo_path, input, suggested_branch, worktree_path).await
+}
+
+async fn git_resolve_pr_inner(
     repo_path: String,
     input: String,
     suggested_branch: String,
@@ -1050,7 +1134,7 @@ mod tests {
 
         // Same tip as the base → merged (equality OR strict descendant,
         // matching git_branch_merged's semantics).
-        let merged = git_branch_merged(
+        let merged = git_branch_merged_inner(
             repo_dir.to_string_lossy().into_owned(),
             "feat-x".to_string(),
             "master".to_string(),
@@ -1059,7 +1143,7 @@ mod tests {
         .unwrap();
         assert!(merged);
 
-        let result = git_worktree_remove(
+        let result = git_worktree_remove_inner(
             repo_dir.to_string_lossy().into_owned(),
             target.to_string_lossy().into_owned(),
             Some("feat-x".to_string()),
@@ -1071,9 +1155,7 @@ mod tests {
         assert!(result.branch_deleted);
         assert!(!target.exists());
         let repo = crate::git::open_repo(&repo_dir.to_string_lossy()).unwrap();
-        assert!(repo
-            .find_branch("feat-x", git2::BranchType::Local)
-            .is_err());
+        assert!(repo.find_branch("feat-x", git2::BranchType::Local).is_err());
     }
 
     #[tokio::test]
@@ -1145,8 +1227,12 @@ mod tests {
         let repo_dir = scratch.join("repo");
         std::fs::create_dir_all(&repo_dir).unwrap();
         let repo = init_repo(&repo_dir);
-        repo.branch("taken", &repo.head().unwrap().peel_to_commit().unwrap(), false)
-            .unwrap();
+        repo.branch(
+            "taken",
+            &repo.head().unwrap().peel_to_commit().unwrap(),
+            false,
+        )
+        .unwrap();
 
         // Existing branch without existing_branch → branch_exists.
         let args = create_args(&repo_dir, "taken", &scratch.join("wt-a"));
@@ -1243,7 +1329,7 @@ mod tests {
             let _ = std::fs::remove_dir_all(entry.path());
         }
 
-        let result = git_worktree_remove(
+        let result = git_worktree_remove_inner(
             repo_dir.to_string_lossy().into_owned(),
             target.to_string_lossy().into_owned(),
             Some("orphan-branch".to_string()),

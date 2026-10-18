@@ -1,5 +1,5 @@
 import { create } from "zustand";
-import { ipc, type SessionMeta, type SessionPage } from "@/lib/ipc";
+import { ipc, type CachedRemoteSessionPage, type SessionMeta, type SessionPage } from "@/lib/ipc";
 import { botById } from "@/features/bots/bot-store";
 import { getSelectedBot } from "@/features/bots/selected-bot";
 import {
@@ -77,6 +77,17 @@ function loadHistoryPage(
     : ipc.loadSessionPage(engine, sessionId, limit, beforeSeq);
 }
 
+function loadCachedHistoryPage(
+  engine: string, sessionId: string, workspacePath: string,
+  limit?: number, beforeSeq?: number | null,
+): Promise<CachedRemoteSessionPage | null> {
+  const meta = useChatStore.getState().sessions.find((session) =>
+    session.engine === engine && session.sessionId === sessionId && session.workspacePath === workspacePath,
+  );
+  if (!meta?.remote || !meta.remotePath) return Promise.resolve(null);
+  return ipc.loadCachedRemoteSessionPage(workspacePath, engine, sessionId, meta.remotePath, limit, beforeSeq);
+}
+
 export const useChatStore = create<ChatStore>((set, get) => {
   /** 一轮对话 / 一个会话的复盘上下文：选中了开着重盘的 Bot 才返回。
    *  复盘是记忆的子功能：记忆或复盘任一关着、Bot 已删，都不触发。 */
@@ -150,6 +161,7 @@ export const useChatStore = create<ChatStore>((set, get) => {
     set,
     get,
     loadHistoryPage,
+    loadCachedHistoryPage,
     eventTeardowns,
     activateTab,
     removeTab,

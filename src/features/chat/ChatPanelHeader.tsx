@@ -8,11 +8,15 @@ import { pluginPanelTabIcon } from "@/features/plugins/hub/PluginPanelTabIcon";
 import { cx } from "@/utils/cx";
 import { PANEL_TOGGLE_CLASSES } from "./panel-toggle-classes";
 import { resolveActivePanelTab, useSortedPanelTabs } from "./use-panel-tabs";
+import { sessionKey, useChatStore } from "./store";
+import { isSshWorkspacePath } from "@/lib/ssh-workspace";
+import { HistoryCacheButton } from "./components/HistoryCacheButton";
 
 /** Tab-strip actions slot: the open-in-app cluster plus the side panel's
  * titlebar header (files/changes pills and collapse toggles). */
 export function ChatPanelHeader({
   workspacePath,
+  activeTabKey,
   panelTab,
   onPanelTabChange,
   panelCollapsed,
@@ -22,6 +26,7 @@ export function ChatPanelHeader({
   dragging,
 }: {
   workspacePath: string;
+  activeTabKey: string | null;
   panelTab: string;
   onPanelTabChange: (tab: string) => void;
   panelCollapsed: boolean;
@@ -31,6 +36,11 @@ export function ChatPanelHeader({
   dragging: "sidebar" | "panel" | null;
 }) {
   const { t } = useTranslation();
+  const remote = useChatStore((state) => isSshWorkspacePath(state.workspaces, workspacePath));
+  const active = useChatStore((state) => state.active);
+  const historyCache = useChatStore((state) => activeTabKey ? state.bySession[activeTabKey]?.historyCache : null);
+  const historySession = remote && active?.sessionId && active.workspacePath === workspacePath &&
+    activeTabKey === sessionKey(active.engine, active.sessionId, active.workspacePath) ? active : null;
   // Builtin tabs (files/changes) register at module scope in ./panel-tabs;
   // plugin tabs arrive via ctx.ui.registerPanelTab (plan §4.2 #4).
   const panelTabs = useSortedPanelTabs();
@@ -43,8 +53,11 @@ export function ChatPanelHeader({
   );
   return (
     <div className="flex h-full items-center">
-      <LaunchScriptActions key={workspacePath} workspacePath={workspacePath} />
-      <HeaderOpenActions workspacePath={workspacePath} />
+      {!remote && <LaunchScriptActions key={workspacePath} workspacePath={workspacePath} />}
+      <HeaderOpenActions workspacePath={workspacePath} remote={remote} />
+      {historySession && <HistoryCacheButton cache={historyCache ?? null} onRefresh={() => {
+        if (historySession.sessionId) void useChatStore.getState().selectSession(historySession.engine, historySession.sessionId, historySession.workspacePath);
+      }} />}
       {
         // Deliberately outside the xl-gated chrome below: that wrapper is
         // display:none on narrow windows, and the toggle used to vanish with

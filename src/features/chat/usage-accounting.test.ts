@@ -115,6 +115,69 @@ describe("usage accounting", () => {
     expect(parseUsage(settled.usage)).toMatchObject({ input: 500, output: 10 });
   });
 
+  it("settles nested occupancy while keeping the reply's aggregate billing separate", () => {
+    handleEngineEvents([event("usage", 1, { input_tokens: 1_000, output_tokens: 40 })], deps());
+    handleEngineEvents([event("usage", 2, { input_tokens: 500, output_tokens: 10 })], deps());
+    handleEngineEvents([event("done", 3, { usage: {
+      input_tokens: 1_500, output_tokens: 50, model_context_window: 1_000_000,
+      last_token_usage: { input_tokens: 500, output_tokens: 10 },
+    } })], deps());
+    expect(parseUsage(session().usage)).toMatchObject({ input: 500, output: 10, contextWindow: 1_000_000 });
+    expect(parseUsage(session().messages.at(-1)?.usage)).toMatchObject({ input: 1_500, output: 50 });
+    expect(ipc.usageRecord).toHaveBeenCalledTimes(2);
+  });
+
+  it("uses Done's explicit occupancy when no live per-request reports arrived", () => {
+    const previous = { input_tokens: 90_000, model_context_window: 200_000 };
+    useChatStore.setState({ bySession: { [KEY]: { ...session(), usage: previous } } });
+    handleEngineEvents([event("done", 1, { usage: {
+      input_tokens: 50_000, output_tokens: 2_000, model_context_window: 1_000_000,
+      last_token_usage: { input_tokens: 8_000, output_tokens: 100 },
+    } })], deps());
+    expect(parseUsage(session().usage)).toMatchObject({ input: 8_000, output: 100, contextWindow: 1_000_000 });
+    expect(parseUsage(session().messages.at(-1)?.usage)).toMatchObject({ input: 50_000, output: 2_000 });
+    expect(ipc.usageRecord).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({ input: 50_000, output: 2_000 }));
+  });
+
+  it("does not bill context-only compaction, then bills Done's outer aggregate once", () => {
+    handleEngineEvents([event("usage", 1, { input_tokens: 8_000, total_tokens: 8_000, context_only: true })], deps());
+    expect(parseUsage(session().usage)?.total).toBe(8_000);
+    expect(session().turnUsage).toBeNull();
+    expect(ipc.usageRecord).not.toHaveBeenCalled();
+    handleEngineEvents([event("done", 2, { usage: {
+      input_tokens: 50_000, output_tokens: 2_000,
+      last_token_usage: { input_tokens: 8_000, total_tokens: 8_000 },
+    } })], deps());
+    expect(parseUsage(session().usage)?.total).toBe(8_000);
+    expect(parseUsage(session().messages.at(-1)?.usage)).toMatchObject({ input: 50_000, output: 2_000 });
+    expect(ipc.usageRecord).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({ input: 50_000, output: 2_000 }));
+  });
+
+  it("keeps an in-progress reply's billing total through context-only compaction", () => {
+    handleEngineEvents([event("usage", 1, { input_tokens: 90_000, output_tokens: 1_000 })], deps());
+    handleEngineEvents([event("usage", 2, { input_tokens: 8_000, total_tokens: 8_000, context_only: true })], deps());
+    expect(parseUsage(session().usage)?.total).toBe(8_000);
+    expect(parseUsage(session().turnUsage)?.total).toBe(91_000);
+    handleEngineEvents([event("done", 3, { usage: {
+      input_tokens: 90_000, output_tokens: 1_000,
+      last_token_usage: { input_tokens: 8_000, total_tokens: 8_000 },
+    } })], deps());
+    expect(parseUsage(session().usage)?.total).toBe(8_000);
+    expect(parseUsage(session().messages.at(-1)?.usage)?.total).toBe(91_000);
+    expect(ipc.usageRecord).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({ input: 90_000, output: 1_000 }));
+  });
+
+  it("retains known occupancy through empty reports and aggregate-only settlement", () => {
+    const previous = { input_tokens: 90_000, model_context_window: 1_000_000 };
+    useChatStore.setState({ bySession: { [KEY]: { ...session(), usage: previous } } });
+    handleEngineEvents([event("usage", 1, { input_tokens: 0, output_tokens: 0 })], deps());
+    expect(session().usage).toBe(previous);
+    handleEngineEvents([event("done", 2, { usage: { input_tokens: 500_000, output_tokens: 10_000 } })], deps());
+    expect(parseUsage(session().usage)).toMatchObject({ input: 90_000, contextWindow: 1_000_000 });
+    expect(parseUsage(session().messages.at(-1)?.usage)).toMatchObject({ input: 500_000, output: 10_000 });
+    expect(ipc.usageRecord).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({ input: 500_000, output: 10_000 }));
+  });
+
   it("records Claude's resolved custom model instead of the selected family alias", () => {
     const tab = { engine: "claude", sessionId: "s-1", workspacePath: "/tmp/ws", model: "haiku" };
     const key = sessionKey(tab.engine, tab.sessionId, tab.workspacePath);

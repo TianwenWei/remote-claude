@@ -23,7 +23,7 @@ import {
 import { MessageTimeline } from "./MessageTimeline";
 import { ConversationFooter } from "./ConversationFooter";
 import { useComposerActions } from "./use-composer-actions";
-import { filterEngineOptions, orderEngineOptions } from "./engine-options";
+import { filterEngineOptions, orderEngineOptions, sshWorkspaceAllowedEngines } from "./engine-options";
 import { useCliNavOrder } from "@/lib/cli-nav-order";
 import { ErrorBanner } from "./ErrorBanner";
 import { useBranchSwitcher } from "./use-branch-switcher";
@@ -33,7 +33,7 @@ import { useTabModelDisplay } from "./use-tab-model-display";
 import type { EngineInfo, Workspace } from "@/lib/ipc";
 import type { OmpServiceTier } from "@/lib/omp-service-tier";
 import { EmptyState } from "@/components/base/empty-state";
-import { parseUsage } from "../usage";
+import { reportedContextWindow } from "../usage";
 import { rememberContextWindow, resolveContextMax } from "../context-window-memory";
 import { useWorkspaceUIHooks, workspaceAllowedEngines } from "../workspace-ui-bridge";
 import { ConversationModePane, ConversationModePicker } from "@/features/plugins/conversation/ConversationModeHost";
@@ -407,7 +407,7 @@ export const ChatConversation = memo(function ChatConversation({
       (m) => m.id === displayModel,
     )?.contextWindow,
   });
-  const observedWindow = parseUsage(sessionUsage)?.contextWindow;
+  const observedWindow = reportedContextWindow(sessionUsage);
   useEffect(() => {
     if (observedWindow) {
       rememberContextWindow(activeEngine, displayModel, observedWindow);
@@ -462,8 +462,11 @@ export const ChatConversation = memo(function ChatConversation({
   const uiHooks = useWorkspaceUIHooks();
   const allowedEngines = useMemo(
     // uiHooks 进依赖:插件 activate/热重载换 hooks 后允许表及时重算。
-    () => workspaceAllowedEngines(active?.workspacePath),
-    [uiHooks, active?.workspacePath],
+    () => {
+      return sshWorkspaceAllowedEngines(workspaces.find((workspace) => workspace.path === active?.workspacePath))
+        ?? workspaceAllowedEngines(active?.workspacePath);
+    },
+    [uiHooks, active?.workspacePath, workspaces],
   );
   const { addMenu, cliMenu, permissionMenu, noEnabledEngines } =
     useConversationMenus({

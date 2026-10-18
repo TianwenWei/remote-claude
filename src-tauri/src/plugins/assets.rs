@@ -154,7 +154,7 @@ pub(super) fn denied_grant_root(canonical: &Path) -> bool {
     if canonical == home {
         return true;
     }
-    [".ssh", ".aws", ".gnupg", ".ccgui-next"].iter().any(|denied| {
+    [".ssh", ".aws", ".gnupg", ".ccgui-next", ".ccgui-remote-vps"].iter().any(|denied| {
         let denied = home.join(denied);
         canonical.starts_with(&denied) || denied.starts_with(canonical)
     })
@@ -641,6 +641,14 @@ mod tests {
         // outcomes are refusals, never grants.
         assert!(grant_directory_at(&state_path, "vendor.one", &home).is_err());
         assert!(grant_directory_at(&state_path, "vendor.one", &home.join(".ssh")).is_err());
+        // Both installed desktop profiles contain credentials and history;
+        // the Remote build must protect its new profile at the grant boundary.
+        let canonical_home = dunce::canonicalize(&home).unwrap_or_else(|_| home.clone());
+        for profile in [".ccgui-next", ".ccgui-remote-vps"] {
+            assert!(denied_grant_root(&canonical_home.join(profile)));
+            assert!(denied_grant_root(&canonical_home.join(profile).join("plugins")));
+        }
+        assert!(!denied_grant_root(&canonical_home.join(".ccgui-remote-vps-project")));
         // A grant recorded before the deny list existed is refused at read
         // time as well.
         let mut state = state::read_state(&state_path).unwrap();

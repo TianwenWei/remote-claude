@@ -3,6 +3,7 @@
 import {
   useCallback,
   useEffect,
+  useId,
   useMemo,
   useRef,
   useState,
@@ -466,6 +467,7 @@ export function StatusBar({
   selectedFolder,
   onFolderSelect,
   usagePct,
+  accountUsage,
   contextMax,
   contextSegments,
   onCompactContext,
@@ -486,6 +488,7 @@ export function StatusBar({
   selectedFolder?: string;
   onFolderSelect?: (name: string) => void;
   usagePct?: number;
+  accountUsage?: ReactNode;
   contextMax?: number;
   contextSegments?: ContextSegment[];
   onCompactContext?: () => void;
@@ -503,6 +506,7 @@ export function StatusBar({
   // `isNonModal` popovers don't dismiss on outside press (react-aria couples
   // the two); restore it manually — same fix as Select (see the hook doc).
   const [contextOpen, setContextOpen] = useState(false);
+  const unknownContextId = useId();
   const contextTriggerRef = useRef<HTMLButtonElement>(null);
   const contextPopoverRef = useRef<HTMLElement>(null);
   useDismissOnOutsidePress(contextOpen, () => setContextOpen(false), [
@@ -514,12 +518,13 @@ export function StatusBar({
   // left group after the branch switcher, each behind its own boundary.
   const pluginItems = useRegistry(composerStatusRegistry);
   const limitsContext = useMemo(
-    () => ({ max: contextMax ?? ASSUMED_CONTEXT_WINDOW, segments: contextSegments ?? [] }),
-    [contextMax, contextSegments],
+    () => ({ max: contextMax ?? ASSUMED_CONTEXT_WINDOW, segments: contextSegments ?? [], known: usagePct !== undefined }),
+    [contextMax, contextSegments, usagePct],
   );
   const limitsText = useMemo(
     () => ({
       contextWindow: t("chat.contextWindow"),
+      contextUsageUnknown: t("chat.contextUsageUnknown"),
       freeSpace: t("chat.freeSpace"),
       planUsageLimits: t("chat.planUsageLimits"),
       managePlan: t("chat.managePlan"),
@@ -577,7 +582,8 @@ export function StatusBar({
       </div>
       <div className="flex items-center gap-3">
         <ProxyQuickToggle />
-        {/* Context meter is always on: 0% until the first usage report. */}
+        {accountUsage}
+        {/* Keep unknown distinct from an authoritative zero-percent report. */}
         <AriaDialogTrigger
           isOpen={contextOpen}
           onOpenChange={(o) => allowContextOpenChange(o) && setContextOpen(o)}
@@ -585,12 +591,14 @@ export function StatusBar({
           <AriaButton
             ref={contextTriggerRef}
             aria-label={t("chat.contextWindow")}
+            aria-describedby={usagePct === undefined ? unknownContextId : undefined}
             className="flex cursor-pointer items-center gap-1 rounded-[40px] py-1 pr-2 pl-1.5 outline-none transition-colors duration-150 ease focus-visible:ring-2 focus-visible:ring-border-focus-ring"
           >
             <ContextRing pct={usagePct ?? 0} />
             <span className="text-body-2-medium whitespace-nowrap text-text-secondary">
-              {usagePct ?? 0}%
+              {usagePct === undefined ? "—" : `${usagePct}%`}
             </span>
+            {usagePct === undefined && <span id={unknownContextId} className="sr-only">{t("chat.contextUsageUnknown")}</span>}
           </AriaButton>
           <AriaPopover
             ref={contextPopoverRef}

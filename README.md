@@ -1,3 +1,7 @@
+> **Remote Claude — macOS friends trial**
+>
+> This repository contains the configurable SSH Remote Claude fork. Start with [朋友试用说明](docs/remote-claude-trial.zh-CN.md) and [Remote build instructions](README.remote-vps.md). Upstream attribution and licensing provenance: [UPSTREAM-NOTICE.md](UPSTREAM-NOTICE.md). The upstream README is preserved below.
+
 <div align="center">
 
 # Desktop CC GUI

@@ -34,6 +34,9 @@ export interface AiChatRepo {
   /** Plugin-provided badge text (e.g. "WSL") rendered as a chip after the
    *  label; styling comes from the plugin's injected CSS. */
   labelSuffix?: string;
+  /** Secondary workspace metadata below the name, independently truncated
+   *  so long remote hosts cannot consume the name's horizontal space. */
+  labelDescription?: string;
   /** Expanded on first render (folder-open icon + visible threads). */
   defaultOpen?: boolean;
   /** Worktree child workspaces attached under this repo, each carrying its

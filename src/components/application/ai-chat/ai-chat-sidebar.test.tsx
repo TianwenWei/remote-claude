@@ -5,6 +5,11 @@ import { sessionMenuRegistry, workspaceMenuRegistry } from "@ccgui/plugin-sdk";
 import { AiChatSidebar } from "./ai-chat-sidebar";
 import type { AiChatRepo } from "./ai-chat-sidebar";
 
+vi.mock("@/lib/platform", async (importOriginal) => ({
+  ...await importOriginal<typeof import("@/lib/platform")>(),
+  isWeb: false,
+}));
+
 vi.mock("react-i18next", () => ({
   useTranslation: () => ({ t: (key: string) => key }),
   // The palette's content-hit rows format relative time via the real i18n
@@ -47,6 +52,17 @@ async function render(repos: AiChatRepo[]) {
     root.render(<AiChatSidebar repos={repos} />);
   });
 }
+
+it("offers a visible remote project creation action next to the workspace tree", async () => {
+  const createRemote = vi.fn();
+  const addLocal = vi.fn();
+  await act(async () => root.render(<AiChatSidebar repos={[repo("welcome")]} onAddWorkspace={addLocal} onNewRemoteProject={createRemote} />));
+  const action = [...node.querySelectorAll("button")].find((button) => button.textContent?.includes("settings.sshNewProject"));
+  expect(action).toBeDefined();
+  await act(async () => action!.click());
+  expect(createRemote).toHaveBeenCalledOnce();
+  expect(addLocal).not.toHaveBeenCalled();
+});
 
 it("remembers which workspaces the user expanded", async () => {
   // The bug: expansion lived in component state, so every restart reopened

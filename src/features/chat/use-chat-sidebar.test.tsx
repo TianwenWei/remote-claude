@@ -28,6 +28,7 @@ vi.mock("@/lib/events", () => ({
   listenComputerUseEscape: vi.fn(async () => () => {}),
 }));
 vi.mock("@/lib/platform", () => ({
+  isWeb: false,
   pickDirectory: vi.fn(async () => null),
 }));
 // 聚焦助手自带 rAF 重试窗口，单测里只关心语义。
@@ -195,6 +196,24 @@ describe("useChatSidebar repo mapping", () => {
       });
     });
     expect(captured[0]?.labelSuffix).toBe("WSL");
+  });
+
+  it("keeps SSH host metadata separate from the project name in active and archived rows", async () => {
+    const remote = { ...WS, name: "welcome", meta: { ssh: {
+      host: "192.0.2.10", user: "cc", port: 22, identityFile: null, workspace: WS.path,
+      enginePaths: { claude: "/usr/bin/claude" },
+    } } } as Workspace;
+    await act(async () => useChatStore.setState({ workspaces: [remote] }));
+    expect(captured[0]).toMatchObject({ label: "welcome", labelDescription: "SSH · 192.0.2.10" });
+    expect(captured[0]?.labelSuffix).toBeUndefined();
+    await act(async () => useChatStore.setState({ archivedWorkspaces: [WS.id] }));
+    expect(sidebar.archivedRepos[0]).toMatchObject({ label: "welcome", labelDescription: "SSH · 192.0.2.10" });
+  });
+
+  it("opens remote project creation from the sidebar without a local directory picker", async () => {
+    await act(async () => sidebar.handleNewRemoteProject());
+    expect(window.location.hash).toBe("#/settings?page=workspaces&action=new-ssh-project");
+    window.location.hash = "";
   });
 
   it("maps retrying state to the matching sidebar thread", async () => {

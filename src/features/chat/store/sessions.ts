@@ -2,6 +2,7 @@ import { normalizeOmpServiceTier } from "@/lib/omp-service-tier";
 import {
   ipc,
   type EngineInfo,
+  type Message,
   type SessionMeta,
   type Workspace,
 } from "@/lib/ipc";
@@ -43,12 +44,22 @@ import {
   visibleSessions,
 } from "./session-utils";
 import type { ChatStore } from "./types";
-import type { LoadHistoryPage, StoreGet, StoreSet } from "./context";
+import type { LoadCachedHistoryPage, LoadHistoryPage, StoreGet, StoreSet } from "./context";
+import { listSshSessionMetas } from "./ssh-sessions";
+import { cachedSshSessionMetas, removeCachedSshSessionMeta } from "./ssh-session-catalog";
 
 function omitKey(rec: Record<string, boolean>, key: string) {
   const next = { ...rec };
   delete next[key];
   return next;
+}
+
+/** A refreshed tail replaces the cached window while older pages already
+ * opened by the reader stay visible. A live turn owns its current rows. */
+function refreshCachedMessages(current: Message[], fresh: Message[]): Message[] {
+  if (!fresh.length) return fresh;
+  const first = Math.min(...fresh.map((message) => message.seq));
+  return [...current.filter((message) => message.seq < first), ...fresh];
 }
 
 function archivedKeyMap(sessions: SessionMeta[]): Record<string, true> {
@@ -79,6 +90,7 @@ export interface SessionDeps {
   set: StoreSet;
   get: StoreGet;
   loadHistoryPage: LoadHistoryPage;
+  loadCachedHistoryPage: LoadCachedHistoryPage;
   /** Module-scope unlisteners (store.ts) init pushes into; HMR dispose runs them. */
   eventTeardowns: Array<() => void>;
   activateTab: (tab: ActiveSession | null) => void;
@@ -112,6 +124,7 @@ export function createSessionActions(
     set,
     get,
     loadHistoryPage,
+    loadCachedHistoryPage,
     eventTeardowns,
     activateTab,
     removeTab,
@@ -120,6 +133,21 @@ export function createSessionActions(
     markUnseenIfBackground,
     turnSettled,
   } = deps;
+
+  let sshCatalogGeneration = 0;
+  let sshHistoryActionError: string | null = null;
+
+  function sshHistoryErrorPatch(errors: Array<{ name: string; error: string }>, current: string | null): { actionError?: string | null } {
+    if (errors.length) {
+      // A catalog failure must not replace an unrelated action's diagnosis.
+      if (current && current !== sshHistoryActionError) return {};
+      sshHistoryActionError = errors.map((error) => i18n.t("settings.sshHistoryFailed", error)).join("\n");
+      return { actionError: sshHistoryActionError };
+    }
+    const owned = sshHistoryActionError !== null && current === sshHistoryActionError;
+    sshHistoryActionError = null;
+    return owned ? { actionError: null } : {};
+  }
 
   /** Migrate the engine pref off a CLI that is gone or disabled in
    * settings. All CLIs disabled: leave the pref alone — the composer shows
@@ -176,10 +204,15 @@ export function createSessionActions(
       // scan so WSL 等远端会话进侧栏,且重启时已开标签不至于因“会话表无
       // 此会话”被清掉。
       setSessionSourcesChangedCallback(() => void get().refreshSessions());
-      const external = await listExternalSessionMetas();
       const archivedSessionKeys = archivedKeyMap(archivedSessions);
+      const cached = cachedSshSessionMetas(workspaces);
+      // Publish the offline catalog before any remote listing can block.
+      set({ workspaces, engines, archivedSessionKeys, sessions: visibleSessions(withoutArchived(
+        mergeExternalSessions(sessions, cached, workspaces.map((workspace) => workspace.path)), archivedSessionKeys,
+      ), engines) });
+      const external = await listExternalSessionMetas();
       const allSessions = withoutArchived(
-        mergeExternalSessions(sessions, external, workspaces.map((w) => w.path)),
+        mergeExternalSessions(sessions, [...external, ...cached], workspaces.map((w) => w.path)),
         archivedSessionKeys,
       );
       set({
@@ -242,21 +275,42 @@ export function createSessionActions(
         .getCliConfig?.()
         ?.then((config) => set({ providers: engineCurrents(config) }))
         .catch(() => {});
+      // Catalog refresh is background work: local snapshots and restored
+      // tabs remain usable during a slow or unavailable SSH connection.
+      const catalogGeneration = ++sshCatalogGeneration;
+      void listSshSessionMetas(workspaces, get().sessions, get().archivedSessionKeys).then((ssh) => {
+        if (catalogGeneration !== sshCatalogGeneration) return;
+        for (const meta of ssh.sessions) {
+          if (get().archivedSessionKeys[sessionKey(meta.engine, meta.sessionId, meta.workspacePath)]) {
+            removeCachedSshSessionMeta(workspaces, meta.engine, meta.sessionId, meta.workspacePath);
+          }
+        }
+        set((state) => ({
+          sessions: visibleSessions(withoutArchived(preserveUnscannedSessions(
+            mergeExternalSessions(sessions, [...external, ...ssh.sessions], workspaces.map((workspace) => workspace.path)),
+            state.sessions, state.bySession,
+          ), state.archivedSessionKeys), state.engines),
+          ...sshHistoryErrorPatch(ssh.errors, state.actionError),
+        }));
+      });
     },
 
     refreshSessions: async () => {
-      const [sessions, external, archivedSessions] = await Promise.all([
+      const catalogGeneration = ++sshCatalogGeneration;
+      const [sessions, external, archivedSessions, ssh] = await Promise.all([
         ipc.listSessions().catch(() => null),
         listExternalSessionMetas(),
         ipc.listArchivedSessions().catch(() => null),
+        listSshSessionMetas(get().workspaces, get().sessions, get().archivedSessionKeys),
       ]);
-      if (!sessions || !archivedSessions) return;
+      if (!sessions || !archivedSessions || catalogGeneration !== sshCatalogGeneration) return;
       const archivedSessionKeys = archivedKeyMap(archivedSessions);
       const merged = withoutArchived(
-        mergeExternalSessions(sessions, external, get().workspaces.map((w) => w.path)),
+        mergeExternalSessions(sessions, [...external, ...ssh.sessions], get().workspaces.map((w) => w.path)),
         archivedSessionKeys,
       );
       for (const session of archivedSessions) {
+        removeCachedSshSessionMeta(get().workspaces, session.engine, session.sessionId, session.workspacePath);
         clearScopedContributions(set, session.engine, session.sessionId, session.workspacePath);
         const tab = get().openTabs.find((candidate) =>
           sameTab(candidate, session.engine, session.sessionId, session.workspacePath),
@@ -312,6 +366,7 @@ export function createSessionActions(
         persistTabs(openTabs, active);
         return {
           sessions: visible,
+          ...sshHistoryErrorPatch(ssh.errors, s.actionError),
           archivedSessionKeys,
           bySession,
           drafts,
@@ -325,20 +380,31 @@ export function createSessionActions(
     },
 
     refreshEngines: async () => {
-      const [engines, sessions, external, archivedSessions, config] = await Promise.all([
+      const catalogGeneration = ++sshCatalogGeneration;
+      const [engines, sessions, external, archivedSessions, config, ssh] = await Promise.all([
         ipc.listEngines().catch(() => null),
         ipc.listSessions().catch(() => null),
         listExternalSessionMetas(),
         ipc.listArchivedSessions().catch(() => null),
         ipc.getCliConfig?.().catch(() => null) ?? Promise.resolve(null),
+        listSshSessionMetas(get().workspaces, get().sessions, get().archivedSessionKeys),
       ]);
       if (!engines) return;
+      if (catalogGeneration !== sshCatalogGeneration) {
+        // Keep engine settings responsive while a newer catalog scan owns
+        // sidebar rows and its error state.
+        set({ engines, ...(config ? { providers: engineCurrents(config) } : {}) });
+        ensureUsableEngine(engines);
+        return;
+      }
+      for (const session of archivedSessions ?? []) removeCachedSshSessionMeta(get().workspaces, session.engine, session.sessionId, session.workspacePath);
       set((s) => {
         const keys = archivedSessions
           ? archivedKeyMap(archivedSessions)
           : s.archivedSessionKeys;
         return {
           engines,
+          ...sshHistoryErrorPatch(ssh.errors, s.actionError),
           archivedSessionKeys: keys,
           ...(sessions
             ? {
@@ -347,7 +413,7 @@ export function createSessionActions(
                     preserveUnscannedSessions(
                       mergeExternalSessions(
                         sessions,
-                        external,
+                        [...external, ...ssh.sessions],
                         s.workspaces.map((w) => w.path),
                       ),
                       s.sessions,
@@ -419,23 +485,58 @@ export function createSessionActions(
       }
       emitSessionActivated(engine, sessionId);
       const existing = get().bySession[key];
-      if (existing && existing.messages.length > 0) return;
-      patchSession(set, key, { loading: true });
+      const remoteHistory = get().sessions.some((session) => session.engine === engine && session.sessionId === sessionId && session.workspacePath === workspacePath && session.remote);
+      if (existing?.loading || existing?.historyCache?.refreshing) return;
+      if (existing?.messages.length && !existing.historyCache) return;
+      const initialSettledRuns = existing?.settledRunIds;
+      let initialTailSeq = Math.max(0, ...(existing?.messages ?? []).map((message) => message.seq));
+      const hasNewLiveRows = (current: typeof EMPTY_SESSION) => current.streaming ||
+        current.settledRunIds !== initialSettledRuns || current.messages.some((message) => message.seq > initialTailSeq);
+      patchSession(set, key, {
+        loading: !existing?.historyCache,
+        error: null,
+        historyCache: existing?.historyCache ? { ...existing.historyCache, refreshing: true, refreshError: null } : null,
+      });
       // 并行取计划审批历史:失败静默降级为无历史计划,绝不阻塞会话加载。
       const plansPromise = ipc
         .listPlanReviews(engine, sessionId)
         .catch(() => null);
       try {
+        if (!existing?.historyCache) {
+          const cached = await loadCachedHistoryPage(engine, sessionId, workspacePath, 100).catch(() => null);
+          if (cached) {
+            set((state) => {
+              const current = state.bySession[key] ?? EMPTY_SESSION;
+              const preserveLive = hasNewLiveRows(current);
+              if (!preserveLive) initialTailSeq = Math.max(0, ...cached.page.messages.map((message) => message.seq));
+              return { bySession: { ...state.bySession, [key]: {
+                ...current,
+                ...(preserveLive ? {} : {
+                  messages: cached.page.messages, subagentHistory: cached.page.subagentHistory,
+                  nextBefore: cached.page.nextBefore,
+                  usage: [...cached.page.messages].reverse().find((message) => message.usage)?.usage ?? current.usage,
+                }),
+                loading: false,
+                historyCache: { cachedAt: cached.cachedAt, refreshing: true, refreshError: null },
+              } } };
+            });
+          }
+        }
         const page = await loadHistoryPage(engine, sessionId, workspacePath, 100);
-        patchSession(set, key, {
-          messages: page.messages,
-          subagentHistory: page.subagentHistory,
-          nextBefore: page.nextBefore,
-          loading: false,
-          // Live "usage" events only cover fresh turns; a resumed session
-          // adopts the newest usage snapshot carried by its history.
-          usage:
-            [...page.messages].reverse().find((m) => m.usage)?.usage ?? null,
+        set((state) => {
+          const current = state.bySession[key] ?? EMPTY_SESSION;
+          return { bySession: { ...state.bySession, [key]: {
+            ...current,
+            ...(hasNewLiveRows(current) ? {} : {
+              messages: current.historyCache ? refreshCachedMessages(current.messages, page.messages) : page.messages,
+              subagentHistory: page.subagentHistory,
+              nextBefore: current.historyCache && current.messages.length ? current.nextBefore : page.nextBefore,
+              usage: [...page.messages].reverse().find((message) => message.usage)?.usage ?? current.usage,
+            }),
+            loading: false,
+            historyCache: remoteHistory ? { cachedAt: Date.now(), refreshing: false, refreshError: null, updated: true } : null,
+            // A runtime error raised during loading belongs to that turn.
+          } } };
         });
         // 历史页应用后再并入计划卡片(按 planId+revision 去重;活跃等待点
         // 可否恢复由后端状态保证,前端只按 record.status 渲染)。
@@ -452,7 +553,15 @@ export function createSessionActions(
           });
         }
       } catch (error) {
-        patchSession(set, key, { loading: false, error: String(error) });
+        set((state) => {
+          const current = state.bySession[key] ?? EMPTY_SESSION;
+          return { bySession: { ...state.bySession, [key]: {
+            ...current, loading: false,
+            ...(current.historyCache ? {
+              historyCache: { ...current.historyCache, refreshing: false, refreshError: errorText(error), updated: false },
+            } : { error: current.error ?? String(error) }),
+          } } };
+        });
       }
     },
 
@@ -473,24 +582,28 @@ export function createSessionActions(
       if (!state?.nextBefore || state.loading) return;
       patchSession(set, targetKey, { loading: true });
       try {
-        const page = await loadHistoryPage(
+        const cached = await loadCachedHistoryPage(
           tab.engine,
           tab.sessionId,
           tab.workspacePath,
           100,
           state.nextBefore,
-        );
+        ).catch(() => null);
+        const page = cached?.page ?? await loadHistoryPage(tab.engine, tab.sessionId, tab.workspacePath, 100, state.nextBefore);
+        const current = get().bySession[targetKey] ?? EMPTY_SESSION;
+        const existingSeqs = new Set(current.messages.map((message) => message.seq));
         patchSession(set, targetKey, {
           messages: [
-            ...page.messages,
-            ...(get().bySession[targetKey] ?? EMPTY_SESSION).messages,
+            ...page.messages.filter((message) => !existingSeqs.has(message.seq)),
+            ...current.messages,
           ],
           nextBefore: page.nextBefore,
           subagentHistory: page.subagentHistory,
           loading: false,
+          ...(cached ? { historyCache: current.historyCache ?? { cachedAt: cached.cachedAt, refreshing: false, refreshError: null } } : {}),
         });
-      } catch {
-        patchSession(set, targetKey, { loading: false });
+      } catch (error) {
+        patchSession(set, targetKey, { loading: false, error: errorText(error) });
       }
     },
 
@@ -507,6 +620,7 @@ export function createSessionActions(
         set({ actionError: errorText(error) });
         return;
       }
+      removeCachedSshSessionMeta(get().workspaces, engine, sessionId, workspacePath);
       set((s) => {
         const bySession = { ...s.bySession };
         const drafts = { ...s.drafts };
@@ -548,6 +662,7 @@ export function createSessionActions(
         return;
       }
       set({ actionError: null });
+      removeCachedSshSessionMeta(get().workspaces, engine, sessionId, meta?.workspacePath);
       const key = sessionKey(engine, sessionId, "");
       const tab = get().openTabs.find(
         (t) => t.engine === engine && t.sessionId === sessionId,

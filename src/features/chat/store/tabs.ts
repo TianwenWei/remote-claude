@@ -1,4 +1,5 @@
 import { writeStored } from "@/lib/storage";
+import { sshWorkspaceMetaOf } from "@/lib/ssh-workspace";
 import {
   ENGINE_PREF_KEY,
   persistTabs,
@@ -197,14 +198,16 @@ export function createTabActions(
       // One pending chat per workspace+engine: re-focus it instead of
       // piling up empty "new" tabs.
       set((s) => {
+        const ssh = sshWorkspaceMetaOf(s.workspaces.find((workspace) => workspace.path === workspacePath));
+        const engine = ssh?.enginePaths.claude ? "claude" : s.activeEngine;
         const existing = s.openTabs.find(
           (t) =>
             t.sessionId === null &&
-            t.engine === s.activeEngine &&
+            t.engine === engine &&
             t.workspacePath === workspacePath,
         );
         const tab: ActiveSession = existing ?? {
-          engine: s.activeEngine,
+          engine,
           sessionId: null,
           workspacePath,
         };
@@ -224,7 +227,7 @@ export function createTabActions(
               }
             : s.pendingRuntimeSwitch;
         persistTabs(openTabs, tab);
-        return { openTabs, active: tab, pendingRuntimeSwitch };
+        return { openTabs, active: tab, activeEngine: engine, pendingRuntimeSwitch };
       });
     },
 

@@ -1,5 +1,5 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import { ipc, type EngineInfo } from "@/lib/ipc";
+import { ipc, type EngineInfo, type Workspace } from "@/lib/ipc";
 
 /**
  * 电脑操控 (computer use) send path: the `/ccgui-cua <task>` flag has to
@@ -65,6 +65,7 @@ describe("computer-use sends", () => {
     vi.mocked(ipc.computerUseSetActive).mockClear();
     useChatStore.setState({
       engines: [engine("omp", true)],
+      workspaces: [],
       active: { engine: "omp", sessionId: "s-1", workspacePath: WS },
       openTabs: [{ engine: "omp", sessionId: "s-1", workspacePath: WS }],
       activeEngine: "omp",
@@ -95,6 +96,15 @@ describe("computer-use sends", () => {
       expect.objectContaining({ computerUse: false }),
     );
     expect(vi.mocked(ipc.computerUseSetActive)).not.toHaveBeenCalled();
+  });
+
+  it("refuses computer use in an SSH workspace without arming local machine control", async () => {
+    useChatStore.setState({ workspaces: [{ path: WS, meta: { ssh: { host: "vps", user: "cc", port: 22,
+      identityFile: null, workspace: WS, enginePaths: { claude: "/usr/bin/claude" } } } } as unknown as Workspace] });
+    await useChatStore.getState().send("打开计算器", [], { computerUse: true });
+    expect(ipc.sendMessage).not.toHaveBeenCalled();
+    expect(ipc.computerUseSetActive).not.toHaveBeenCalled();
+    expect(useChatStore.getState().bySession[KEY]?.error).toBeTruthy();
   });
 
   it("refuses an engine that cannot mount the driver", async () => {

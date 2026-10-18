@@ -1,0 +1,36 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>SSH 首次配置 · 纯前端模拟</title>
+</head>
+<body>
+  <div id="fixture"></div>
+  <script>
+    // Isolate every imported store from browser/app preferences. Nothing here
+    // reads or writes persistent storage, private keys or a real native host.
+    function memoryStorage() {
+      const values = new Map();
+      return {
+        get length() { return values.size; },
+        getItem(key) { return values.get(String(key)) ?? null; },
+        setItem(key, value) { values.set(String(key), String(value)); },
+        removeItem(key) { values.delete(String(key)); },
+        clear() { values.clear(); },
+        key(index) { return Array.from(values.keys())[index] ?? null; },
+      };
+    }
+    Object.defineProperty(window, "localStorage", { value: memoryStorage(), configurable: true });
+    Object.defineProperty(window, "sessionStorage", { value: memoryStorage(), configurable: true });
+    window.__TAURI_INTERNALS__ = {
+      transformCallback() { return 1; },
+      unregisterCallback() {},
+      convertFileSrc: (path) => path,
+      metadata: { currentWebview: { label: "main" }, currentWindow: { label: "main" } },
+      async invoke(command) { throw new Error("SSH fixture blocked unexpected IPC: " + command); },
+    };
+  </script>
+  <script type="module" src="./ssh-onboarding.tsx"></script>
+</body>
+</html>

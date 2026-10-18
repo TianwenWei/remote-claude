@@ -6,6 +6,8 @@ import { ContextMenu, type ContextMenuEntry } from "@/components/context-menu";
 import { copyText } from "@/lib/clipboard";
 import { ipc } from "@/lib/ipc";
 import { useFilesStore } from "@/features/files/store";
+import { useChatStore } from "@/features/chat/store";
+import { isSshWorkspacePath } from "@/lib/ssh-workspace";
 import { resolveChatFileLink } from "@/features/chat/file-link-resolution";
 import {
   OPEN_APP_ICONS,
@@ -50,6 +52,7 @@ export function FileLinkContextMenu({
   onClose: () => void;
 }) {
   const { t } = useTranslation();
+  const remote = useChatStore((state) => isSshWorkspacePath(state.workspaces, menu.workspacePath));
 
   const target =
     OPEN_APP_TARGETS.find((candidate) => candidate.id === readSelectedOpenAppId()) ??
@@ -110,11 +113,11 @@ export function FileLinkContextMenu({
     ...(target.kind === "finder" ? [] : [revealEntry]),
     {
       id: "copy-link",
-      label: t("files.copyLink"),
+      label: t(remote ? "files.copyPath" : "files.copyLink"),
       icon: <Link2 className="size-4" aria-hidden />,
       onSelect: () =>
         act((path) => {
-          const link = path.startsWith("/") ? `file://${path}` : path;
+          const link = !remote && path.startsWith("/") ? `file://${path}` : path;
           void copyText(link);
         }),
     },
@@ -125,7 +128,7 @@ export function FileLinkContextMenu({
       x={menu.x}
       y={menu.y}
       ariaLabel={menu.path}
-      entries={entries}
+      entries={remote ? entries.filter((entry) => entry.id !== "reveal" && entry.id !== "open-in-app") : entries}
       onClose={onClose}
     />
   );

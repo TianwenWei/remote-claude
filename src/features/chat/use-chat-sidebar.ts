@@ -9,6 +9,7 @@ import type { AiChatRepo, AiChatRepoSection, ThreadAction } from "@/components/a
 import { ARCHIVED_SECTION_ID } from "@/components/application/ai-chat/use-sidebar-state";
 import { copyText } from "@/lib/clipboard";
 import { worktreeMetaOf, type SessionMeta, type Workspace } from "@/lib/ipc";
+import { sshWorkspaceMetaOf } from "@/lib/ssh-workspace";
 import { isWeb, pickDirectory } from "@/lib/platform";
 import { recentPointerAnchor } from "@/lib/pointer-anchor";
 import { parseDraftSessionKey, sessionKey, useChatStore, sortedWorkspaceGroups } from "./store";
@@ -110,7 +111,8 @@ export function useChatSidebar({
       // Sidebar alias: a user-set name replaces the folder name in the
       // sidebar only; the original stays on the row tooltip.
       const alias = workspaceAliases[w.id]?.trim();
-      const suffix = workspaceLabelSuffix(w.path);
+      const ssh = sshWorkspaceMetaOf(w);
+      const suffix = ssh ? null : workspaceLabelSuffix(w.path);
       const meta = worktreeMetaOf(w);
       const children = childrenByParent.get(w.id);
       return {
@@ -120,6 +122,7 @@ export function useChatSidebar({
         label: alias || (meta?.branch ?? w.name),
         originalLabel: alias || meta ? w.name : undefined,
         labelSuffix: suffix ?? undefined,
+        labelDescription: ssh ? t("settings.sshRemoteLabel", { host: ssh.host }) : undefined,
         defaultOpen,
         threadLimit,
         worktree: meta ? { branch: meta.branch, prNumber: meta.prNumber ?? undefined } : undefined,
@@ -195,15 +198,23 @@ export function useChatSidebar({
     for (const w of workspaces) {
       if (!archivedIds.has(w.id)) continue;
       const alias = workspaceAliases[w.id]?.trim();
+      const ssh = sshWorkspaceMetaOf(w);
       result.push({
         id: w.id,
         label: alias || w.name,
         originalLabel: alias ? w.name : undefined,
+        labelDescription: ssh ? t("settings.sshRemoteLabel", { host: ssh.host }) : undefined,
         threads: [],
       });
     }
     return result;
-  }, [workspaces, archivedIds, workspaceAliases]);
+  }, [workspaces, archivedIds, workspaceAliases, t]);
+
+  const handleNewRemoteProject = useCallback(() => {
+    if (isWeb) return;
+    window.location.hash = "#/settings?page=workspaces&action=new-ssh-project";
+    collapseSidebarOnMobile();
+  }, [collapseSidebarOnMobile]);
 
   const handleAddWorkspace = useCallback(() => {
     // 移动端/网页访问模式没有目录选择器，侧栏也不渲染添加入口。
@@ -300,9 +311,13 @@ export function useChatSidebar({
     (workspaceId: string) => {
       const workspace = workspaces.find((w) => w.id === workspaceId);
       const parentId = workspace?.parentId ?? workspaceId;
+      if (sshWorkspaceMetaOf(workspace) || sshWorkspaceMetaOf(workspaces.find((w) => w.id === parentId))) {
+        useChatStore.setState({ actionError: t("settings.sshLocalActionUnsupported") });
+        return;
+      }
       setDialog({ kind: "createWorktree", workspaceId: parentId });
     },
-    [workspaces, setDialog],
+    [workspaces, setDialog, t],
   );
   const handleDeleteWorktree = useCallback(
     (workspaceId: string) => {
@@ -409,6 +424,7 @@ export function useChatSidebar({
     sections,
     archivedRepos,
     handleAddWorkspace,
+    handleNewRemoteProject,
     handleThreadSelect,
     handleThreadAction,
     handleCopyThreadId,

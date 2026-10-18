@@ -28,6 +28,8 @@ export interface SessionState {
   subagentHistory: Message[];
   nextBefore: number | null;
   loading: boolean;
+  /** A local transcript is already visible while the remote source updates. */
+  historyCache?: { cachedAt: number; refreshing: boolean; refreshError: string | null; updated?: boolean } | null;
   streaming: boolean;
   /** Epoch ms when the current streaming turn began; drives the tail
    * indicator's elapsed timer so it survives the indicator's unmount/remount

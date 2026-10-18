@@ -1,0 +1,16 @@
+{
+  "asset": "icon.png",
+  "source": "https://apps.apple.com/us/app/claude-by-anthropic/id6473753684",
+  "artwork": "https://is1-ssl.mzstatic.com/image/thumb/Purple211/v4/95/40/fc/9540fc5b-705f-03bb-fefd-a70c3f840ced/AppIcon-0-0-1x_U007epad-0-1-85-220.png/1024x1024bb.jpg",
+  "publisher": "Anthropic PBC",
+  "retrievedAt": "2026-10-16",
+  "conversion": "Tauri icon generator from the cached official 1024×1024 PNG; macOS Remote build only.",
+  "inputDimensions": [
+    1024,
+    1024
+  ],
+  "dimensions": [
+    512,
+    512
+  ]
+}

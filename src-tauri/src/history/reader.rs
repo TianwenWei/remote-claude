@@ -498,11 +498,42 @@ fn is_subagent_history_tool(message: &Message) -> bool {
     }) {
         return true;
     }
-    let head = message.text.split('·').next().unwrap_or_default().trim().to_ascii_lowercase();
-    let first = head.split(|c: char| c.is_whitespace() || c == '/' || c == '\\').next().unwrap_or_default().replace('-', "_");
-    matches!(first.as_str(), "task" | "agent" | "spawn" | "spawn_agent" | "spawn_subagent"
-        | "workflow" | "run_workflow" | "pipeline" | "dispatch" | "dispatch_agent" | "delegate" | "todo")
-        || ["spawn agent", "agent swarm", "agent_swarm", "workflow", "subagent", "todo"].iter().any(|name| head.contains(name))
+    let head = message
+        .text
+        .split('·')
+        .next()
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_lowercase();
+    let first = head
+        .split(|c: char| c.is_whitespace() || c == '/' || c == '\\')
+        .next()
+        .unwrap_or_default()
+        .replace('-', "_");
+    matches!(
+        first.as_str(),
+        "task"
+            | "agent"
+            | "spawn"
+            | "spawn_agent"
+            | "spawn_subagent"
+            | "workflow"
+            | "run_workflow"
+            | "pipeline"
+            | "dispatch"
+            | "dispatch_agent"
+            | "delegate"
+            | "todo"
+    ) || [
+        "spawn agent",
+        "agent swarm",
+        "agent_swarm",
+        "workflow",
+        "subagent",
+        "todo",
+    ]
+    .iter()
+    .any(|name| head.contains(name))
 }
 
 fn subagent_history_row(message: &Message, delegation: bool) -> Message {
@@ -655,7 +686,227 @@ fn is_plausible_remote_session_path(engine: &str, path: &str) -> bool {
 }
 
 /// 远程转录本拉取上限(base64 前)。
-const MAX_REMOTE_SESSION_BYTES: u64 = 64 * 1024 * 1024;
+const MAX_REMOTE_SESSION_BYTES: u64 = super::remote_cache::MAX_BYTES;
+const REMOTE_HISTORY_TRANSFER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CachedRemoteSessionPage {
+    pub page: SessionPage,
+    pub cached_at: u64,
+}
+
+static REMOTE_CACHE_LOCKS: LazyLock<
+    Mutex<HashMap<PathBuf, std::sync::Weak<tokio::sync::Mutex<()>>>>,
+> = LazyLock::new(|| Mutex::new(HashMap::new()));
+static REMOTE_CACHE_IO_LOCKS: LazyLock<Mutex<HashMap<PathBuf, std::sync::Weak<Mutex<()>>>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+fn remote_cache_io_lock(path: &Path) -> Result<Arc<Mutex<()>>, String> {
+    let mut locks = REMOTE_CACHE_IO_LOCKS.lock().map_err(|e| e.to_string())?;
+    locks.retain(|_, lock| lock.strong_count() > 0);
+    if let Some(lock) = locks.get(path).and_then(std::sync::Weak::upgrade) {
+        return Ok(lock);
+    }
+    let lock = Arc::new(Mutex::new(()));
+    locks.insert(path.to_path_buf(), Arc::downgrade(&lock));
+    Ok(lock)
+}
+
+fn remote_cache_lock(path: &Path) -> Result<Arc<tokio::sync::Mutex<()>>, String> {
+    let mut locks = REMOTE_CACHE_LOCKS.lock().map_err(|e| e.to_string())?;
+    locks.retain(|_, lock| lock.strong_count() > 0);
+    if let Some(lock) = locks.get(path).and_then(std::sync::Weak::upgrade) {
+        return Ok(lock);
+    }
+    let lock = Arc::new(tokio::sync::Mutex::new(()));
+    locks.insert(path.to_path_buf(), Arc::downgrade(&lock));
+    Ok(lock)
+}
+
+fn remote_cache_source(transport: &crate::engine::wsl_transport::WslTransport) -> String {
+    format!(
+        "{}@{}:{}|{}|{}",
+        transport.user,
+        transport.host,
+        transport.port,
+        transport.distro,
+        transport.workspace.as_deref().unwrap_or_default()
+    )
+}
+
+fn remote_cache_for(
+    workspace: &str,
+    engine: &str,
+    sid: &str,
+    remote: &str,
+) -> super::remote_cache::TranscriptCache {
+    super::remote_cache::TranscriptCache::new(
+        &crate::paths::app_home().join("remote-sessions"),
+        workspace,
+        engine,
+        sid,
+        remote,
+    )
+}
+
+fn validated_remote_transport(
+    db: &crate::db::Db,
+    workspace: &str,
+    engine: &str,
+    remote: &str,
+) -> Result<crate::engine::wsl_transport::WslTransport, String> {
+    if !is_plausible_remote_session_path(engine, remote) {
+        return Err(format!("远程会话路径不合法: {remote}"));
+    }
+    let tp = crate::engine::wsl_transport::transport_for_path(db, workspace)?
+        .ok_or_else(|| format!("工作区 {workspace} 未登记远程传输"))?;
+    // The offline path validates the registered source and workspace spelling
+    // locally. Network calls additionally validate the remote realpath.
+    remote_session_scope_script(&tp, engine, remote)?;
+    if tp.distro.is_empty() {
+        let encoded =
+            super::claude_encode_project_path(tp.workspace.as_deref().unwrap_or_default());
+        if Path::new(remote)
+            .parent()
+            .and_then(Path::file_name)
+            .and_then(|p| p.to_str())
+            != Some(encoded.as_str())
+        {
+            return Err("远程转录本不属于此工作区".into());
+        }
+    }
+    Ok(tp)
+}
+
+fn invalidate_parsed_remote_cache(path: &Path) -> Result<(), String> {
+    let mut cache = PARSED_CACHE.lock().map_err(|e| e.to_string())?;
+    cache.retain(|(p, _, _, _), _| p != path);
+    let mut bytes = PARSED_CACHE_BYTES.lock().map_err(|e| e.to_string())?;
+    *bytes = cache
+        .values()
+        .map(|entry| {
+            parsed_footprint(&entry.parsed)
+                + entry
+                    .fold
+                    .iter()
+                    .map(|(_, row)| message_footprint(row))
+                    .sum::<usize>()
+        })
+        .sum();
+    Ok(())
+}
+
+fn publish_remote_cache(
+    cache: &super::remote_cache::TranscriptCache,
+    bytes: &[u8],
+    source: &str,
+    stat: super::remote_cache::RemoteStat,
+) -> Result<(), String> {
+    let lock = remote_cache_io_lock(&cache.path)?;
+    let _guard = lock.lock().map_err(|e| e.to_string())?;
+    if cache.publish(bytes, source, stat)? {
+        // Millisecond file mtimes cannot distinguish every same-size rewrite.
+        invalidate_parsed_remote_cache(&cache.path)?;
+    }
+    Ok(())
+}
+
+fn remote_stat_script(
+    transport: &crate::engine::wsl_transport::WslTransport,
+    engine: &str,
+    remote: &str,
+    legacy_hash: bool,
+) -> Result<String, String> {
+    let quote = crate::engine::wsl_transport::sh_quote;
+    let scope = remote_session_scope_script(transport, engine, remote)?;
+    if transport.distro.is_empty() {
+        Ok(format!(
+            "{scope}\npython3 - {} {MAX_REMOTE_SESSION_BYTES} {} <<'CCGUI_STAT'\n{}\nCCGUI_STAT\n",
+            quote(remote),
+            if legacy_hash { 1 } else { 0 },
+            super::remote_cache::STAT_PY
+        ))
+    } else {
+        Ok(format!("stat -c '%s:%y' -- {}\n", quote(remote)))
+    }
+}
+
+fn parse_remote_stat(
+    transport: &crate::engine::wsl_transport::WslTransport,
+    raw: &str,
+) -> Result<super::remote_cache::StatResponse, String> {
+    let response = if transport.distro.is_empty() {
+        serde_json::from_str(raw).map_err(|e| format!("远程历史元数据无效: {e}"))?
+    } else {
+        let (size, modified) = raw.trim().split_once(':').ok_or("远程历史元数据无效")?;
+        super::remote_cache::StatResponse {
+            stat: super::remote_cache::RemoteStat {
+                size: size.parse().map_err(|_| "远程历史大小无效")?,
+                modified: modified.into(),
+                changed: None,
+                inode: None,
+            },
+            sha256: None,
+        }
+    };
+    if response.stat.size > MAX_REMOTE_SESSION_BYTES {
+        return Err("远程会话文件超过64MB上限".into());
+    }
+    Ok(response)
+}
+
+fn cached_remote_page_blocking(
+    db: &crate::db::Db,
+    cache: &super::remote_cache::TranscriptCache,
+    source: &str,
+    engine: &str,
+    session_id: &str,
+    limit: Option<usize>,
+    before_seq: Option<i64>,
+) -> Result<Option<CachedRemoteSessionPage>, String> {
+    let lock = remote_cache_io_lock(&cache.path)?;
+    let _guard = lock.lock().map_err(|e| e.to_string())?;
+    let Some(snapshot) = cache.read(source, false)? else {
+        return Ok(None);
+    };
+    let page =
+        remote_session_page_blocking(db, engine, session_id, &cache.path, limit, before_seq)?;
+    Ok(Some(CachedRemoteSessionPage {
+        page,
+        cached_at: snapshot.cached_at,
+    }))
+}
+
+/// Restore a complete, source-bound local snapshot without contacting SSH.
+#[tauri::command]
+pub async fn load_cached_remote_session_page(
+    state: tauri::State<'_, crate::AppState>,
+    workspace_path: String,
+    engine: String,
+    session_id: String,
+    remote_path: String,
+    limit: Option<usize>,
+    before_seq: Option<i64>,
+) -> Result<Option<CachedRemoteSessionPage>, String> {
+    let transport = validated_remote_transport(&state.db, &workspace_path, &engine, &remote_path)?;
+    let source = remote_cache_source(&transport);
+    let cache = remote_cache_for(&workspace_path, &engine, &session_id, &remote_path);
+    let db = Arc::clone(&state.db);
+    tauri::async_runtime::spawn_blocking(move || {
+        cached_remote_page_blocking(
+            &db,
+            &cache,
+            &source,
+            &engine,
+            &session_id,
+            limit,
+            before_seq,
+        )
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
 
 /// 远程工作区会话的历史回放:插件会话源把远端 jsonl 绝对路径随 `remotePath`
 /// 上报;这里经引擎 spawn 同一套远程通道 `base64` 拉回转录本,落到本机缓存
@@ -671,43 +922,90 @@ pub async fn load_remote_session_page(
     limit: Option<usize>,
     before_seq: Option<i64>,
 ) -> Result<SessionPage, String> {
-    use sha2::Digest as _;
-    if !is_plausible_remote_session_path(&engine, &remote_path) {
-        return Err(format!("远程会话路径不合法: {remote_path}"));
+    use crate::engine::wsl_transport::{
+        run_readonly_script_output, run_readonly_script_output_with_timeout, sh_quote,
+    };
+    let transport = validated_remote_transport(&state.db, &workspace_path, &engine, &remote_path)?;
+    let source = remote_cache_source(&transport);
+    let cache = remote_cache_for(&workspace_path, &engine, &session_id, &remote_path);
+    let lock = remote_cache_lock(&cache.path)?;
+    let _guard = lock.lock().await;
+    let read_cache = cache.clone();
+    let read_source = source.clone();
+    let snapshot = tauri::async_runtime::spawn_blocking(move || {
+        let lock = remote_cache_io_lock(&read_cache.path)?;
+        let _guard = lock.lock().map_err(|e| e.to_string())?;
+        read_cache.read(&read_source, true)
+    })
+    .await
+    .map_err(|e| e.to_string())??;
+    let metadata = run_readonly_script_output(
+        &transport,
+        &remote_stat_script(
+            &transport,
+            &engine,
+            &remote_path,
+            snapshot.as_ref().is_some_and(|s| s.is_legacy()),
+        )?,
+    )
+    .await?;
+    let stat = parse_remote_stat(&transport, &metadata)?;
+    let unchanged = snapshot.as_ref().is_some_and(|s| s.matches(&stat.stat));
+    let verified_legacy = snapshot.as_ref().is_some_and(|s| {
+        s.is_legacy()
+            && s.bytes.len() as u64 == stat.stat.size
+            && stat.sha256.as_ref() == Some(&s.hash())
+    });
+    if !unchanged {
+        let (bytes, fetched_stat) = if verified_legacy {
+            (snapshot.ok_or("历史缓存缺失")?.bytes, stat.stat)
+        } else if transport.distro.is_empty() {
+            let script = format!("{}\npython3 - {} {MAX_REMOTE_SESSION_BYTES} <<'CCGUI_TRANSCRIPT'\n{}\nCCGUI_TRANSCRIPT\n",
+                remote_session_scope_script(&transport, &engine, &remote_path)?, sh_quote(&remote_path), super::remote_cache::TRANSFER_PY);
+            let raw = run_readonly_script_output_with_timeout(
+                &transport,
+                &script,
+                REMOTE_HISTORY_TRANSFER_TIMEOUT,
+            )
+            .await?;
+            tauri::async_runtime::spawn_blocking(move || super::remote_cache::decode_transfer(&raw))
+                .await
+                .map_err(|e| e.to_string())??
+        } else {
+            // Preserve WSL's existing coreutils/base64 protocol and noise
+            // stripping; the Linux gzip path does not add a Python dependency.
+            let script = format!("sz=$(stat -c %s -- {0}) || exit $?\n[ \"$sz\" -le {MAX_REMOTE_SESSION_BYTES} ] || exit 4\nbase64 -w0 -- {0}\n", sh_quote(&remote_path));
+            let raw = run_readonly_script_output_with_timeout(
+                &transport,
+                &script,
+                REMOTE_HISTORY_TRANSFER_TIMEOUT,
+            )
+            .await?;
+            if raw.len() as u64 > (MAX_REMOTE_SESSION_BYTES + 2) / 3 * 4 + 4 {
+                return Err("远程会话文件超过64MB上限".into());
+            }
+            let bytes = base64::engine::general_purpose::STANDARD
+                .decode(raw.trim())
+                .map_err(|e| format!("远程转录本解码失败: {e}"))?;
+            let after = run_readonly_script_output(
+                &transport,
+                &remote_stat_script(&transport, &engine, &remote_path, false)?,
+            )
+            .await?;
+            let after = parse_remote_stat(&transport, &after)?;
+            if after.stat != stat.stat || bytes.len() as u64 != after.stat.size {
+                return Err("远程历史在读取时发生变化，请重试".into());
+            }
+            (bytes, after.stat)
+        };
+        let publish_cache = cache.clone();
+        tauri::async_runtime::spawn_blocking(move || {
+            publish_remote_cache(&publish_cache, &bytes, &source, fetched_stat)
+        })
+        .await
+        .map_err(|e| e.to_string())??;
     }
-    let transport =
-        crate::engine::wsl_transport::transport_for_workspace(&state.db, &workspace_path)
-            .ok_or_else(|| format!("工作区 {workspace_path} 未登记远程传输"))?;
-    // 先远端 stat 卡住字节上限再 base64,超限/不可读直接非零退出,
-    // 避免超大转录本经 1.33× 膨胀后全量进内存。
-    let quoted = crate::engine::wsl_transport::sh_quote(&remote_path);
-    let script = format!(
-        "sz=$(stat -c %s -- {quoted} 2>/dev/null) || {{ echo '远程会话文件不可读' >&2; exit 3; }}; \
-         [ \"$sz\" -le {MAX_REMOTE_SESSION_BYTES} ] || {{ echo \"远程会话文件过大(${{sz}}B,上限 {MAX_REMOTE_SESSION_BYTES}B)\" >&2; exit 4; }}; \
-         base64 -w0 -- {quoted}"
-    );
-    // run_script_output 已剥传输层噪声;载荷是单行 base64。
-    let raw = crate::engine::wsl_transport::run_script_output(&transport, &script).await?;
-    let bytes = base64::engine::general_purpose::STANDARD
-        .decode(raw.trim())
-        .map_err(|e| format!("远程转录本解码失败: {e}"))?;
-
-    let dir = crate::paths::app_home().join("remote-sessions");
-    std::fs::create_dir_all(&dir).map_err(|e| format!("创建缓存目录失败: {e}"))?;
-    let digest = sha2::Sha256::digest(format!(
-        "{workspace_path}|{engine}|{session_id}|{remote_path}"
-    ));
-    let name: String = digest[..16].iter().map(|b| format!("{b:02x}")).collect();
-    let cache_path = dir.join(format!("{name}.jsonl"));
-    let stale = std::fs::read(&cache_path)
-        .map(|old| old != bytes)
-        .unwrap_or(true);
-    if stale {
-        let tmp = dir.join(format!("{name}.jsonl.tmp"));
-        std::fs::write(&tmp, &bytes).map_err(|e| format!("写缓存失败: {e}"))?;
-        std::fs::rename(&tmp, &cache_path).map_err(|e| format!("缓存落位失败: {e}"))?;
-    }
-
+    let cache_path = cache.path;
     let engine_for_parse = engine.clone();
     let db = Arc::clone(&state.db);
     tauri::async_runtime::spawn_blocking(move || {
@@ -799,9 +1097,7 @@ fn delete_dir_session_disk_anchored(
             .is_file(),
         "grok" => session_dir.join("chat_history.jsonl").is_file(),
         // minimax 会话目录 = manifest.json + messages.jsonl 的 dated dir。
-        "minimax" => {
-            path.is_file() && session_dir.join("manifest.json").is_file()
-        }
+        "minimax" => path.is_file() && session_dir.join("manifest.json").is_file(),
         // dsh 主转录本的世代文件名即结构标记(db 路径本就来自同名规则的扫描)。
         _ => {
             path.is_file()
@@ -1036,15 +1332,48 @@ pub async fn delete_remote_session(
     remote_path: String,
 ) -> Result<(), String> {
     let script = remote_session_delete_script(&engine, &remote_path)?;
-    let transport = crate::engine::wsl_transport::transport_for_workspace(&state.db, &workspace_path)
-        .ok_or_else(|| format!("工作区 {workspace_path} 未登记远程传输"))?;
+    let transport = validated_remote_transport(&state.db, &workspace_path, &engine, &remote_path)?;
+    let cache = remote_cache_for(&workspace_path, &engine, &session_id, &remote_path);
+    let lock = remote_cache_lock(&cache.path)?;
+    let _guard = lock.lock().await;
+    let script = format!(
+        "{}\n{script}",
+        remote_session_scope_script(&transport, &engine, &remote_path)?
+    );
     delete_remote_session_and_frames(
         Arc::clone(&state.db),
         engine,
         session_id,
-        crate::engine::wsl_transport::run_script_output(&transport, &script),
+        async {
+            let result = crate::engine::wsl_transport::run_script_output(&transport, &script).await?;
+            let io_lock = remote_cache_io_lock(&cache.path)?;
+            let _io_guard = io_lock.lock().map_err(|e| e.to_string())?;
+            cache.purge()?;
+            invalidate_parsed_remote_cache(&cache.path)?;
+            Ok(result)
+        },
     )
     .await
+}
+
+fn remote_session_scope_script(
+    transport: &crate::engine::wsl_transport::WslTransport,
+    engine: &str,
+    remote_path: &str,
+) -> Result<String, String> {
+    if !transport.distro.is_empty() {
+        return Ok(String::new());
+    }
+    if engine != "claude" {
+        return Err("Native SSH history currently supports Claude Code".into());
+    }
+    let workspace = transport
+        .workspace
+        .as_deref()
+        .ok_or("Missing remote workspace root")?;
+    let encoded = super::claude_encode_project_path(workspace);
+    let quote = crate::engine::wsl_transport::sh_quote;
+    Ok(format!("python3 - {} {} <<'CCGUI_SESSION_SCOPE' || exit $?\nimport os,sys\nroot=os.path.realpath(os.path.join(os.environ.get('CLAUDE_CONFIG_DIR',os.path.expanduser('~/.claude')),'projects',sys.argv[1]))\npath=os.path.realpath(sys.argv[2])\nif os.path.dirname(path)!=root: raise RuntimeError('Remote transcript is outside this workspace')\nCCGUI_SESSION_SCOPE\n", quote(&encoded), quote(remote_path)))
 }
 
 #[tauri::command]
@@ -1272,9 +1601,11 @@ pub fn add_workspace(
     // serves trusted host UI only (a plugin bypassing the JS gate via direct
     // IPC would otherwise set it here).
     if let Some(m) = &meta {
-        if m.as_object().is_some_and(|o| o.contains_key("wsl")) {
+        if m.as_object()
+            .is_some_and(|o| o.contains_key("wsl") || o.contains_key("ssh"))
+        {
             return Err(
-                "wsl meta requires plugin_add_workspace (host:workspace:remote grant)".to_string(),
+                "remote meta requires an authorized remote workspace registration".to_string(),
             );
         }
     }
@@ -1347,14 +1678,27 @@ pub(crate) fn add_workspace_inner(
             "" => trimmed.to_string(),
             rest => rest.to_string(),
         });
-    let id = uuid::Uuid::new_v4().to_string();
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as i64)
         .unwrap_or(0);
     let meta_json = meta.as_ref().map(|m| m.to_string());
-    {
+    let id = {
         let conn = state.db.0.lock();
+        crate::engine::remote_workspace::validate_workspace_registration(
+            &conn,
+            trimmed,
+            meta.as_ref(),
+        )?;
+        let id = conn
+            .query_row(
+                "SELECT id FROM workspaces WHERE path=?1",
+                [trimmed],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(|e| e.to_string())?
+            .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
         conn.execute(
             "INSERT INTO workspaces(id, path, name, last_opened_at, kind, parent_id, meta)
              VALUES(?1,?2,?3,?4,?5,?6,?7)
@@ -1365,7 +1709,8 @@ pub(crate) fn add_workspace_inner(
             rusqlite::params![id, trimmed, name, now, kind, parent_id, meta_json],
         )
         .map_err(|e| e.to_string())?;
-    }
+        id
+    };
     super::scanner::spawn_scan(Arc::clone(&state.db), Arc::clone(&state.sink));
     Ok(Workspace {
         id,
@@ -1520,9 +1865,15 @@ mod tests {
         let workspace = home.join("ws");
         std::fs::create_dir_all(&workspace).unwrap();
         let file = home.join("s.jsonl");
-        let recorded = "<CCGUI_INTERNAL_abcdefgh>{\"pluginId\":\"bridge\"}</CCGUI_INTERNAL_abcdefgh>";
-        let unrecorded = "<CCGUI_INTERNAL_zzzzzzzz>{\"pluginId\":\"other\"}</CCGUI_INTERNAL_zzzzzzzz>";
-        write_session(&file, &workspace, &format!("answer {recorded} tail {unrecorded}"));
+        let recorded =
+            "<CCGUI_INTERNAL_abcdefgh>{\"pluginId\":\"bridge\"}</CCGUI_INTERNAL_abcdefgh>";
+        let unrecorded =
+            "<CCGUI_INTERNAL_zzzzzzzz>{\"pluginId\":\"other\"}</CCGUI_INTERNAL_zzzzzzzz>";
+        write_session(
+            &file,
+            &workspace,
+            &format!("answer {recorded} tail {unrecorded}"),
+        );
 
         let db = crate::db::Db::open_at(&home.join("app.db")).unwrap();
         {
@@ -1584,9 +1935,15 @@ mod tests {
         let workspace = home.join("ws");
         std::fs::create_dir_all(&workspace).unwrap();
         let cache = home.join("remote-cache.jsonl");
-        let recorded = "<CCGUI_INTERNAL_abcdefgh>{\"pluginId\":\"bridge\"}</CCGUI_INTERNAL_abcdefgh>";
-        let unrecorded = "<CCGUI_INTERNAL_zzzzzzzz>{\"pluginId\":\"other\"}</CCGUI_INTERNAL_zzzzzzzz>";
-        write_session(&cache, &workspace, &format!("answer {recorded} tail {unrecorded}"));
+        let recorded =
+            "<CCGUI_INTERNAL_abcdefgh>{\"pluginId\":\"bridge\"}</CCGUI_INTERNAL_abcdefgh>";
+        let unrecorded =
+            "<CCGUI_INTERNAL_zzzzzzzz>{\"pluginId\":\"other\"}</CCGUI_INTERNAL_zzzzzzzz>";
+        write_session(
+            &cache,
+            &workspace,
+            &format!("answer {recorded} tail {unrecorded}"),
+        );
 
         let db = crate::db::Db::open_at(&home.join("app.db")).unwrap();
         let assistant = |page: &SessionPage| {
@@ -1649,10 +2006,20 @@ mod tests {
             )
             .unwrap();
         }
-        db.record_accepted_internal_frame_hash("omp", "sid-1", &"a".repeat(64), &workspace.to_string_lossy())
-            .unwrap();
-        db.record_accepted_internal_frame_hash("omp", "kept", &"b".repeat(64), &workspace.to_string_lossy())
-            .unwrap();
+        db.record_accepted_internal_frame_hash(
+            "omp",
+            "sid-1",
+            &"a".repeat(64),
+            &workspace.to_string_lossy(),
+        )
+        .unwrap();
+        db.record_accepted_internal_frame_hash(
+            "omp",
+            "kept",
+            &"b".repeat(64),
+            &workspace.to_string_lossy(),
+        )
+        .unwrap();
         for session_id in ["sid-1", "kept"] {
             db.remember_session_provider("omp", session_id, "provider", 1).unwrap();
             let session = SessionMeta {
@@ -1693,8 +2060,13 @@ mod tests {
             ("dsh", "kept", "b"),
             ("omp", "remote-1", "c"),
         ] {
-            db.record_accepted_internal_frame_hash(engine, session_id, &hash.repeat(64), "/remote/ws")
-                .unwrap();
+            db.record_accepted_internal_frame_hash(
+                engine,
+                session_id,
+                &hash.repeat(64),
+                "/remote/ws",
+            )
+            .unwrap();
         }
         let before = (
             db.accepted_internal_frames("dsh", "remote-1").unwrap(),
@@ -1732,8 +2104,13 @@ mod tests {
             ("dsh", "kept", "c"),
             ("omp", "remote-1", "d"),
         ] {
-            db.record_accepted_internal_frame_hash(engine, session_id, &hash.repeat(64), "/remote/ws")
-                .unwrap();
+            db.record_accepted_internal_frame_hash(
+                engine,
+                session_id,
+                &hash.repeat(64),
+                "/remote/ws",
+            )
+            .unwrap();
         }
         let before = db.accepted_internal_frames("dsh", "remote-1").unwrap();
         let same_engine = db.accepted_internal_frames("dsh", "kept").unwrap();
@@ -1816,6 +2193,133 @@ mod tests {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.0);
         }
+    }
+
+    #[test]
+    fn remote_cache_same_size_rewrite_invalidates_parsed_snapshot_even_with_same_local_mtime() {
+        let scratch = Scratch::new();
+        let db = crate::db::Db::open_at(&scratch.0.join("app.db")).unwrap();
+        let cache = super::super::remote_cache::TranscriptCache::new(
+            &scratch.0.join("cache"),
+            "/workspace",
+            "claude",
+            "sid",
+            "/home/dev/.claude/projects/-workspace/sid.jsonl",
+        );
+        let a = b"{\"type\":\"assistant\",\"message\":{\"content\":[{\"type\":\"text\",\"text\":\"first\"}]}}\n";
+        let b = b"{\"type\":\"assistant\",\"message\":{\"content\":[{\"type\":\"text\",\"text\":\"other\"}]}}\n";
+        let stat = |modified: &str| super::super::remote_cache::RemoteStat {
+            size: a.len() as u64,
+            modified: modified.into(),
+            changed: None,
+            inode: None,
+        };
+        publish_remote_cache(&cache, a, "source", stat("1")).unwrap();
+        let old_time = std::fs::metadata(&cache.path).unwrap().modified().unwrap();
+        let page = remote_session_page_blocking(&db, "claude", "sid", &cache.path, None, None).unwrap();
+        assert_eq!(page.messages[0].text, "first");
+        publish_remote_cache(&cache, b, "source", stat("2")).unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(&cache.path)
+            .unwrap()
+            .set_times(std::fs::FileTimes::new().set_modified(old_time))
+            .unwrap();
+        let page = remote_session_page_blocking(&db, "claude", "sid", &cache.path, None, None).unwrap();
+        assert_eq!(page.messages[0].text, "other");
+    }
+
+    #[test]
+    fn remote_cache_publication_lock_keeps_concurrent_manifest_and_bytes_consistent() {
+        let scratch = Scratch::new();
+        let cache = super::super::remote_cache::TranscriptCache::new(
+            &scratch.0.join("cache"),
+            "/workspace",
+            "claude",
+            "sid",
+            "/home/dev/.claude/projects/-workspace/sid.jsonl",
+        );
+        let workers: Vec<_> = (0..8)
+            .map(|n| {
+                let cache = cache.clone();
+                std::thread::spawn(move || {
+                    let bytes = n.to_string().repeat(100).into_bytes();
+                    publish_remote_cache(
+                        &cache,
+                        &bytes,
+                        "source",
+                        super::super::remote_cache::RemoteStat {
+                            size: bytes.len() as u64,
+                            modified: n.to_string(),
+                            changed: None,
+                            inode: None,
+                        },
+                    )
+                })
+            })
+            .collect();
+        for worker in workers {
+            worker.join().unwrap().unwrap();
+        }
+        assert!(cache.read("source", false).unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn remote_cache_pages_are_available_locally_while_network_refresh_is_in_flight() {
+        let scratch = Scratch::new();
+        let db = crate::db::Db::open_at(&scratch.0.join("app.db")).unwrap();
+        let cache = super::super::remote_cache::TranscriptCache::new(
+            &scratch.0.join("cache"),
+            "/workspace",
+            "claude",
+            "sid",
+            "/home/dev/.claude/projects/-workspace/sid.jsonl",
+        );
+        let bytes: Vec<u8> = (0..3).flat_map(|n| {
+            format!("{{\"type\":\"assistant\",\"message\":{{\"content\":[{{\"type\":\"text\",\"text\":\"message-{n}\"}}]}}}}\n").into_bytes()
+        }).collect();
+        publish_remote_cache(
+            &cache,
+            &bytes,
+            "source",
+            super::super::remote_cache::RemoteStat {
+                size: bytes.len() as u64,
+                modified: "1".into(),
+                changed: None,
+                inode: None,
+            },
+        )
+        .unwrap();
+        let network_lock = remote_cache_lock(&cache.path).unwrap();
+        let _refresh = network_lock.lock().await;
+        let newest = cached_remote_page_blocking(&db, &cache, "source", "claude", "sid", Some(1), None)
+            .unwrap()
+            .unwrap();
+        assert_eq!(newest.page.messages[0].text, "message-2");
+        assert!(newest.cached_at > 0);
+        let earlier = cached_remote_page_blocking(
+            &db,
+            &cache,
+            "source",
+            "claude",
+            "sid",
+            Some(1),
+            newest.page.next_before,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(earlier.page.messages[0].text, "message-1");
+        assert!(cached_remote_page_blocking(
+            &db,
+            &cache,
+            "different-host",
+            "claude",
+            "sid",
+            None,
+            None
+        )
+        .unwrap()
+        .is_none());
     }
 
     fn archived_fixture() -> SessionMeta {
@@ -2113,12 +2617,25 @@ mod tests {
             let error = delete_session_blocking(&db, engine, "failed").unwrap_err();
             assert!(error.contains("remove "), "{error}");
             assert!(path.is_dir());
-            for table in ["accepted_internal_frames", "sessions", "session_models", "session_efforts", "session_providers", "session_archives"] {
-                let count: i64 = db.0.lock().query_row(
-                    &format!("SELECT COUNT(*) FROM {table} WHERE engine=?1 AND session_id='failed'"),
-                    [engine],
-                    |r| r.get(0),
-                ).unwrap();
+            for table in [
+                "accepted_internal_frames",
+                "sessions",
+                "session_models",
+                "session_efforts",
+                "session_providers",
+                "session_archives",
+            ] {
+                let count: i64 = db
+                    .0
+                    .lock()
+                    .query_row(
+                        &format!(
+                            "SELECT COUNT(*) FROM {table} WHERE engine=?1 AND session_id='failed'"
+                        ),
+                        [engine],
+                        |r| r.get(0),
+                    )
+                    .unwrap();
                 assert_eq!(count, 1, "{engine}: {table}");
             }
         }
@@ -2349,7 +2866,11 @@ mod tests {
         let scratch = Scratch::new();
         let dir = scratch.0.join("sessions").join("session 'one");
         std::fs::create_dir_all(&dir).unwrap();
-        let generations = ["session.jsonl.zstd", "session.v1.jsonl.zstd", "session.v2.jsonl.zstd"];
+        let generations = [
+            "session.jsonl.zstd",
+            "session.v1.jsonl.zstd",
+            "session.v2.jsonl.zstd",
+        ];
         for name in generations {
             std::fs::write(dir.join(name), "transcript").unwrap();
         }

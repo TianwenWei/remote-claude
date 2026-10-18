@@ -3,7 +3,7 @@ use super::{
     tool_call_patch_with_id, BuiltCommand, Engine, EngineEvent, SendRequest,
 };
 use serde_json::Value;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Mutex;
 
 pub struct ClaudeEngine {
@@ -21,6 +21,48 @@ pub struct ClaudeEngine {
     /// Post-compaction remaining context tokens from `compact_boundary` event,
     /// used to report accurate post-compaction usage instead of the turn's billing usage.
     compact_post_tokens: Mutex<Option<i64>>,
+    request_usage: Mutex<RequestUsageState>,
+}
+
+#[derive(Default)]
+struct RequestUsageState {
+    latest: Option<Value>,
+    model: Option<String>,
+    seen: HashSet<String>,
+    order: VecDeque<String>,
+}
+
+impl RequestUsageState {
+    fn observe(&mut self, message: &Value) -> Option<Value> {
+        let usage = message_usage(message)?;
+        if let Some(id) = message
+            .get("id")
+            .and_then(Value::as_str)
+            .filter(|id| !id.is_empty())
+        {
+            if !self.seen.insert(id.to_string()) {
+                return None;
+            }
+            self.order.push_back(id.to_string());
+            if self.order.len() > 4096 {
+                if let Some(oldest) = self.order.pop_front() {
+                    self.seen.remove(&oldest);
+                }
+            }
+        }
+        self.latest = Some(usage.clone());
+        self.model = message
+            .get("model")
+            .and_then(Value::as_str)
+            .map(str::to_string);
+        Some(usage)
+    }
+
+    fn finish(&mut self) -> (Option<Value>, Option<String>) {
+        self.seen.clear();
+        self.order.clear();
+        (self.latest.take(), self.model.take())
+    }
 }
 
 struct PendingTool {
@@ -37,6 +79,7 @@ impl ClaudeEngine {
             tool_names: Mutex::new(HashMap::new()),
             tool_paths: Mutex::new(HashMap::new()),
             compact_post_tokens: Mutex::new(None),
+            request_usage: Mutex::new(RequestUsageState::default()),
         }
     }
 }
@@ -290,9 +333,13 @@ impl Engine for ClaudeEngine {
                         if let Ok(mut lock) = self.compact_post_tokens.lock() {
                             *lock = Some(post_tokens);
                         }
+                        if let Ok(mut state) = self.request_usage.lock() {
+                            state.latest = None;
+                        }
                         let usage_obj = serde_json::json!({
                             "input_tokens": post_tokens,
                             "total_tokens": post_tokens,
+                            "context_only": true,
                         });
                         out.push(EngineEvent::Usage(usage_obj));
                     }
@@ -336,13 +383,23 @@ impl Engine for ClaudeEngine {
                 // The response's own account of what ran. `<synthetic>` marks
                 // messages the CLI fabricated locally (errors, interrupts):
                 // that is not a served model and must not read as one.
-                let served_model = reported_model
-                    .filter(|model| !model.starts_with('<'));
+                let served_model = reported_model.filter(|model| !model.starts_with('<'));
                 if served_model.is_some() || reported_effort.is_some() {
                     out.push(EngineEvent::Served {
                         model: served_model,
                         effort: reported_effort,
                     });
+                }
+                let request_usage = value
+                    .get("message")
+                    .and_then(|message| self.request_usage.lock().ok()?.observe(message));
+                if let Some(usage) = request_usage {
+                    // A real request after compaction supersedes the boundary's
+                    // estimate. Multiple content snapshots share message.id.
+                    if let Ok(mut pending) = self.compact_post_tokens.lock() {
+                        *pending = None;
+                    }
+                    out.push(EngineEvent::Usage(usage));
                 }
             }
             "user" => {
@@ -440,15 +497,30 @@ impl Engine for ClaudeEngine {
                     .filter(|s| !s.is_empty())
                     .map(str::to_string);
                 let raw_usage = value.get("usage").cloned();
-                let usage = if let Ok(mut lock) = self.compact_post_tokens.lock() {
-                    match lock.take() {
-                        Some(post_tokens) => Some(compact_usage(post_tokens, raw_usage.as_ref())),
-                        None => raw_usage,
-                    }
-                } else {
-                    raw_usage
+                let (latest_request, model) = self
+                    .request_usage
+                    .lock()
+                    .map(|mut state| state.finish())
+                    .unwrap_or_default();
+                let compact = self
+                    .compact_post_tokens
+                    .lock()
+                    .ok()
+                    .and_then(|mut lock| lock.take());
+                let context = compact
+                    .map(|tokens| compact_usage(tokens, raw_usage.as_ref()))
+                    .or(latest_request);
+                // Preserve cumulative billing at the outer level. Occupancy
+                // comes from one actual request (or a compact boundary).
+                let mut usage =
+                    raw_usage.or_else(|| context.as_ref().map(|_| serde_json::json!({})));
+                if let (Some(context), Some(object)) =
+                    (context, usage.as_mut().and_then(Value::as_object_mut))
+                {
+                    object.insert("last_token_usage".into(), context);
                 }
-                .map(|usage| attach_reported_context_window(usage, &value));
+                let usage = usage
+                    .map(|usage| attach_reported_context_window(usage, &value, model.as_deref()));
                 let is_error = value
                     .get("is_error")
                     .and_then(Value::as_bool)
@@ -466,9 +538,8 @@ impl Engine for ClaudeEngine {
                 }
             }
             "control_request" => {
-                // SDK control protocol asks. AskUserQuestion surfaces to the
-                // UI; every other ask is denied in place (this client has no
-                // approval card), preserving the old headless behavior.
+                // SDK control protocol asks. The SSH client surfaces one-call
+                // approvals; other builds preserve the upstream deny behavior.
                 let request = value.get("request");
                 let subtype = request
                     .and_then(|r| r.get("subtype"))
@@ -500,6 +571,20 @@ impl Engine for ClaudeEngine {
                                 .unwrap_or(Value::Null),
                         });
                     } else {
+                        #[cfg(feature = "remote-vps")]
+                        out.push(EngineEvent::ToolPermissionQuestion {
+                            request_id: request_id.to_string(),
+                            tool_use_id: request
+                                .and_then(|r| r.get("tool_use_id"))
+                                .and_then(Value::as_str)
+                                .map(str::to_string),
+                            tool_name,
+                            input: request
+                                .and_then(|r| r.get("input"))
+                                .cloned()
+                                .unwrap_or(Value::Null),
+                        });
+                        #[cfg(not(feature = "remote-vps"))]
                         out.push(EngineEvent::ControlPermissionDeny {
                             request_id: request_id.to_string(),
                             tool_name,
@@ -517,6 +602,35 @@ impl Engine for ClaudeEngine {
             _ => {}
         }
     }
+
+}
+
+/// Synthetic errors/interrupts are visible messages, but their zero counters
+/// cannot erase the last real request's context usage. Shared with history.
+pub(crate) fn message_usage(message: &Value) -> Option<Value> {
+    if message
+        .get("model")
+        .and_then(Value::as_str)
+        .is_some_and(|m| m.starts_with('<'))
+    {
+        return None;
+    }
+    let usage = message.get("usage")?.as_object()?;
+    let meaningful = [
+        "input_tokens",
+        "output_tokens",
+        "cache_read_input_tokens",
+        "cache_creation_input_tokens",
+        "total_tokens",
+    ]
+    .iter()
+    .any(|key| {
+        usage
+            .get(*key)
+            .and_then(Value::as_u64)
+            .is_some_and(|n| n > 0)
+    });
+    meaningful.then(|| Value::Object(usage.clone()))
 }
 
 /// Fold the CLI's reported context window into a turn's usage.
@@ -527,16 +641,30 @@ impl Engine for ClaudeEngine {
 /// this, every Claude turn fell through to the UI's assumed 200k — wrong for
 /// the 1M `[1m]` variants, and unverifiable for the rest.
 ///
-/// A turn can name several models (a subagent on a cheap model, background
-/// work). The one that actually ran the turn is the one with the most tokens,
-/// so its window wins; entries without a usable window are ignored.
-fn attach_reported_context_window(mut usage: Value, source: &Value) -> Value {
+/// Prefer the last real assistant's model. When no request identified one,
+/// retain the fallback to the busiest reported model with a usable window.
+fn attach_reported_context_window(
+    mut usage: Value,
+    source: &Value,
+    preferred_model: Option<&str>,
+) -> Value {
     if usage.get("model_context_window").is_some() {
         return usage;
     }
     let Some(models) = source.get("modelUsage").and_then(Value::as_object) else {
         return usage;
     };
+    if let Some(window) = preferred_model
+        .and_then(|model| models.get(model))
+        .and_then(|model| model.get("contextWindow"))
+        .and_then(Value::as_i64)
+        .filter(|window| *window > 0)
+    {
+        if let Some(object) = usage.as_object_mut() {
+            object.insert("model_context_window".into(), window.into());
+        }
+        return usage;
+    }
     let busiest = models
         .values()
         .filter_map(|model| {
@@ -565,20 +693,13 @@ fn attach_reported_context_window(mut usage: Value, source: &Value) -> Value {
     usage
 }
 
-/// Usage snapshot for a compacted turn. Occupancy is the post-compaction
-/// remainder (`post_tokens`), not the turn's billing input, but the turn's
-/// output still enters the context afterwards and the reported context
-/// window is carried over so the breakdown keeps its segments and scale
-/// (total = post_tokens + output_tokens).
+/// The boundary's postTokens is occupancy. Cumulative billed output includes
+/// earlier requests, so it must not be added back after compaction.
 fn compact_usage(post_tokens: i64, raw: Option<&Value>) -> Value {
-    let output = raw
-        .and_then(|u| u.get("output_tokens"))
-        .and_then(Value::as_i64)
-        .unwrap_or(0);
     let mut usage = serde_json::json!({
         "input_tokens": post_tokens,
-        "output_tokens": output,
-        "total_tokens": post_tokens + output,
+        "output_tokens": 0,
+        "total_tokens": post_tokens,
     });
     if let (Some(raw), Some(obj)) = (raw, usage.as_object_mut()) {
         if let Some(window) = raw.get("model_context_window") {
@@ -1083,6 +1204,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(not(feature = "remote-vps"))]
     fn other_control_asks_are_denied_in_place() {
         let line = serde_json::json!({
             "type": "control_request",
@@ -1101,6 +1223,29 @@ mod tests {
                 assert_eq!(tool_name, "Bash");
             }
             other => panic!("expected control deny event, got {other:?}"),
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "remote-vps")]
+    fn native_tool_asks_preserve_original_input_for_explicit_approval() {
+        let input = serde_json::json!({"command":"printf 'test'","timeout":1234});
+        let line=serde_json::json!({"type":"control_request","request_id":"tool-approval-1","request":{"subtype":"can_use_tool","tool_name":"Bash","tool_use_id":"call-1","input":input}}).to_string();
+        let mut out = Vec::new();
+        ClaudeEngine::new().parse_line(&line, &mut out);
+        match &out[..] {
+            [EngineEvent::ToolPermissionQuestion {
+                request_id,
+                tool_use_id,
+                tool_name,
+                input: actual,
+            }] => {
+                assert_eq!(request_id, "tool-approval-1");
+                assert_eq!(tool_use_id.as_deref(), Some("call-1"));
+                assert_eq!(tool_name, "Bash");
+                assert_eq!(actual, &input);
+            }
+            other => panic!("Expected explicit native tool approval, got {other:?}"),
         }
     }
 
@@ -1523,7 +1668,7 @@ mod tests {
     }
 
     #[test]
-    fn compact_boundary_emits_usage_and_overrides_turn_result_once() {
+    fn compact_boundary_emits_context_only_and_preserves_result_billing() {
         let engine = ClaudeEngine::new();
         let boundary = serde_json::json!({
             "type": "system",
@@ -1538,20 +1683,23 @@ mod tests {
             EngineEvent::Usage(usage) => {
                 assert_eq!(usage["input_tokens"], 8038);
                 assert_eq!(usage["total_tokens"], 8038);
+                assert_eq!(usage["context_only"], true);
             }
             _ => panic!("expected usage event"),
         }
 
-        // The following result's billing usage is replaced by the
-        // post-compaction occupancy, keeping output and the context window.
+        // Billing remains intact; the context snapshot is carried separately.
         let mut out = Vec::new();
         engine.parse_line(&compact_result_line(), &mut out);
         match &out[0] {
             EngineEvent::Done { usage, .. } => {
                 let usage = usage.as_ref().expect("usage");
-                assert_eq!(usage["input_tokens"], 8038);
+                assert_eq!(usage["input_tokens"], 30190);
                 assert_eq!(usage["output_tokens"], 1200);
-                assert_eq!(usage["total_tokens"], 8038 + 1200);
+                assert_eq!(usage["total_tokens"], 31390);
+                assert_eq!(usage["last_token_usage"]["input_tokens"], 8038);
+                assert_eq!(usage["last_token_usage"]["total_tokens"], 8038);
+                assert_eq!(usage["last_token_usage"]["output_tokens"], 0);
                 assert_eq!(usage["model_context_window"], 200000);
             }
             _ => panic!("expected done event"),
@@ -1566,6 +1714,111 @@ mod tests {
             }
             _ => panic!("expected done event"),
         }
+    }
+
+    #[test]
+    fn assistant_usage_is_per_request_deduped_and_done_retains_aggregate_billing() {
+        let engine = ClaudeEngine::new();
+        let assistant = |id: &str, read: i64| {
+            serde_json::json!({"type":"assistant","message":{
+            "id":id,"model":"main","usage":{"input_tokens":2,"cache_read_input_tokens":read,
+                "cache_creation_input_tokens":20,"output_tokens":5}}})
+            .to_string()
+        };
+        let mut out = Vec::new();
+        engine.parse_line(&assistant("req-1", 1000), &mut out);
+        assert_eq!(
+            out.iter()
+                .filter(|e| matches!(e, EngineEvent::Usage(_)))
+                .count(),
+            1
+        );
+        out.clear();
+        engine.parse_line(&assistant("req-1", 1000), &mut out);
+        assert!(!out.iter().any(|e| matches!(e, EngineEvent::Usage(_))));
+        engine.parse_line(&assistant("req-2", 2000), &mut out);
+        assert_eq!(
+            out.iter()
+                .filter(|e| matches!(e, EngineEvent::Usage(_)))
+                .count(),
+            1
+        );
+        out.clear();
+        engine.parse_line(
+            &serde_json::json!({"type":"assistant","message":{
+            "id":"fake","model":"<synthetic>","usage":{"input_tokens":0,"output_tokens":0,
+                "cache_creation_input_tokens":0,"cache_read_input_tokens":0}}})
+            .to_string(),
+            &mut out,
+        );
+        assert!(!out.iter().any(|e| matches!(e, EngineEvent::Usage(_))));
+        out.clear();
+        engine.parse_line(
+            &serde_json::json!({"type":"result","usage":{"input_tokens":10000,"output_tokens":100},
+            "modelUsage":{"main":{"inputTokens":2000,"contextWindow":1000000},
+                "subagent":{"inputTokens":900000,"contextWindow":200000}}})
+            .to_string(),
+            &mut out,
+        );
+        let Some(EngineEvent::Done {
+            usage: Some(usage), ..
+        }) = out.last()
+        else {
+            panic!("done usage expected")
+        };
+        assert_eq!(usage["input_tokens"], 10000);
+        assert_eq!(usage["output_tokens"], 100);
+        assert_eq!(usage["last_token_usage"]["cache_read_input_tokens"], 2000);
+        assert_eq!(usage["model_context_window"], 1000000);
+        out.clear();
+        engine.parse_line(&assistant("req-1", 1000), &mut out);
+        assert!(
+            out.iter().any(|e| matches!(e, EngineEvent::Usage(_))),
+            "request IDs reset after done"
+        );
+    }
+
+    #[test]
+    fn real_request_after_compaction_supersedes_boundary_occupancy() {
+        let engine = ClaudeEngine::new();
+        let mut out = Vec::new();
+        engine.parse_line(
+            &serde_json::json!({"type":"system","subtype":"compact_boundary",
+            "compactMetadata":{"postTokens":8038}})
+            .to_string(),
+            &mut out,
+        );
+        engine.parse_line(
+            &serde_json::json!({"type":"assistant","message":{"id":"post-compact","model":"main",
+            "usage":{"input_tokens":2,"cache_read_input_tokens":9000,"output_tokens":30}}})
+            .to_string(),
+            &mut out,
+        );
+        engine.parse_line(&compact_result_line(), &mut out);
+        let Some(EngineEvent::Done {
+            usage: Some(usage), ..
+        }) = out.last()
+        else {
+            panic!("done usage expected")
+        };
+        assert_eq!(usage["input_tokens"], 30190);
+        assert_eq!(usage["last_token_usage"]["cache_read_input_tokens"], 9000);
+        assert_eq!(usage["last_token_usage"]["input_tokens"], 2);
+    }
+
+    #[test]
+    fn claude_message_usage_ignores_synthetic_and_empty_but_counts_cached_prompt() {
+        assert!(
+            message_usage(&serde_json::json!({"usage":{"input_tokens":0,"output_tokens":0}})).is_none()
+        );
+        assert!(
+            message_usage(&serde_json::json!({"model":"<synthetic>","usage":{"input_tokens":10}}))
+                .is_none()
+        );
+        let usage = message_usage(&serde_json::json!({"model":"real","usage":{
+            "input_tokens":0,"cache_read_input_tokens":460922,"output_tokens":0}}))
+        .unwrap();
+        assert_eq!(usage["cache_read_input_tokens"], 460922);
     }
 
     #[test]
@@ -1722,7 +1975,8 @@ mod tests {
         match &out[0] {
             EngineEvent::Done { usage, .. } => {
                 let usage = usage.as_ref().expect("usage");
-                assert_eq!(usage["input_tokens"], 40000);
+                assert_eq!(usage["input_tokens"], 900000);
+                assert_eq!(usage["last_token_usage"]["input_tokens"], 40000);
                 assert_eq!(usage["model_context_window"], 1_000_000);
             }
             _ => panic!("expected done event"),

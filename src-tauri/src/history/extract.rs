@@ -1204,7 +1204,7 @@ fn extract_claude_line(value: &Value, images: ImageMode) -> LineRows {
         .unwrap_or(line_type)
         .to_string();
     let ts = ts_string(value, &["timestamp"]);
-    let usage = message.get("usage").cloned();
+    let usage = crate::engine::claude::message_usage(message);
     let model = message
         .get("model")
         .and_then(Value::as_str)
@@ -1261,6 +1261,22 @@ fn extract_claude_line(value: &Value, images: ImageMode) -> LineRows {
                     ..LineRow::new(&role, text, ts)
                 });
             }
+        }
+    }
+    // Tool-only/thinking-only model replies still report the current prompt.
+    // Preserve that snapshot even when the request emitted no assistant text.
+    if role == "assistant" && !out.iter().any(|row| row.usage.is_some()) {
+        if let (Some(usage), Some(row)) = (
+            crate::engine::claude::message_usage(message),
+            out.iter_mut()
+                .rev()
+                .find(|row| row.role == "tool" || row.role == "thinking"),
+        ) {
+            row.usage = Some(usage);
+            row.model = message
+                .get("model")
+                .and_then(Value::as_str)
+                .map(str::to_string);
         }
     }
     out
@@ -2171,6 +2187,48 @@ mod tests {
             }
         });
         assert!(extract_claude_line(&expansion, ImageMode::Collect).is_empty());
+    }
+
+    #[test]
+    fn claude_synthetic_zero_usage_does_not_erase_real_history_context() {
+        let real = serde_json::json!({"type":"assistant","message":{"model":"claude-opus-5-5",
+            "content":[{"type":"text","text":"visible response"}],"usage":{"input_tokens":2,
+                "cache_creation_input_tokens":1212,"cache_read_input_tokens":460922,"output_tokens":1988}}});
+        let synthetic = serde_json::json!({"type":"assistant","message":{"model":"<synthetic>",
+            "content":[{"type":"text","text":"rate limit notice"}],"usage":{"input_tokens":0,
+                "cache_creation_input_tokens":0,"cache_read_input_tokens":0,"output_tokens":0}}});
+        let mut rows = extract_claude_line(&real, ImageMode::Collect);
+        rows.extend(extract_claude_line(&synthetic, ImageMode::Collect));
+        let parsed = fold_rows(rows);
+        assert_eq!(parsed.messages.last().unwrap().text, "rate limit notice");
+        assert!(parsed.messages.last().unwrap().usage.is_none());
+        let usage = parsed
+            .messages
+            .iter()
+            .rev()
+            .find_map(|m| m.usage.as_ref())
+            .unwrap();
+        assert_eq!(usage["cache_read_input_tokens"], 460922);
+        assert_eq!(usage["output_tokens"], 1988);
+    }
+
+    #[test]
+    fn claude_tool_and_thinking_only_history_keep_request_usage() {
+        for content in [
+            serde_json::json!([{"type":"tool_use","name":"Read","input":{"file_path":"/tmp/example"}}]),
+            serde_json::json!([{"type":"thinking","thinking":"thinking fixture"}]),
+        ] {
+            let line = serde_json::json!({"type":"assistant","message":{"model":"real","content":content,
+                "usage":{"input_tokens":2,"cache_read_input_tokens":9000,"output_tokens":30}}});
+            let parsed = fold_rows(extract_claude_line(&line, ImageMode::Collect));
+            let usage = parsed
+                .messages
+                .iter()
+                .rev()
+                .find_map(|m| m.usage.as_ref())
+                .unwrap();
+            assert_eq!(usage["cache_read_input_tokens"], 9000);
+        }
     }
 
     fn claude_user(text: &str, is_meta: bool) -> Value {

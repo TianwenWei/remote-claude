@@ -58,9 +58,7 @@ fn memory_ser<T: serde::Serialize>(
 ) -> Result<Value, String> {
     match r {
         Ok(value) => serde_json::to_value(value).map_err(|e| e.to_string()),
-        Err(error) => Err(
-            serde_json::to_string(&error).unwrap_or_else(|_| error.message),
-        ),
+        Err(error) => Err(serde_json::to_string(&error).unwrap_or_else(|_| error.message)),
     }
 }
 
@@ -803,12 +801,40 @@ pub(super) async fn dispatch(
             ))
         }
         "usage_clear" => ser(crate::usage::usage_clear(app.state())),
+        "claude_account_usage" => {
+            #[derive(serde::Deserialize)]
+            #[serde(rename_all = "camelCase")]
+            struct Args {
+                workspace_path: String,
+                #[serde(default)]
+                force: bool,
+            }
+            let a: Args = parse_args(&raw)?;
+            ser(crate::claude_account_usage::claude_account_usage(
+                app.state(),
+                a.workspace_path,
+                a.force,
+            ).await)
+        }
         "load_session_page" => {
             let a: LoadSessionPageArgs = parse_args(&raw)?;
             ser(crate::history::reader::load_session_page(
                 app.state(),
                 a.engine,
                 a.session_id,
+                a.limit,
+                a.before_seq,
+            )
+            .await)
+        }
+        "load_cached_remote_session_page" => {
+            let a: LoadRemoteSessionPageArgs = parse_args(&raw)?;
+            ser(crate::history::reader::load_cached_remote_session_page(
+                app.state(),
+                a.workspace_path,
+                a.engine,
+                a.session_id,
+                a.remote_path,
                 a.limit,
                 a.before_seq,
             )
@@ -942,7 +968,7 @@ pub(super) async fn dispatch(
         // files
         "list_dir" => {
             let a: PathArgs = parse_args(&raw)?;
-            ser(crate::files::list_dir(app.state(), a.path))
+            ser(crate::files::list_dir(app.state(), a.path).await)
         }
         "read_file" => {
             let a: PathArgs = parse_args(&raw)?;
@@ -950,35 +976,31 @@ pub(super) async fn dispatch(
         }
         "write_file" => {
             let a: WriteFileArgs = parse_args(&raw)?;
-            ser(crate::files::write_file(app.state(), a.path, a.content))
+            ser(crate::files::write_file(app.state(), a.path, a.content).await)
         }
         "create_dir" => {
             let a: PathArgs = parse_args(&raw)?;
-            ser(crate::files::create_dir(app.state(), a.path))
+            ser(crate::files::create_dir(app.state(), a.path).await)
         }
         "create_file" => {
             let a: PathArgs = parse_args(&raw)?;
-            ser(crate::files::create_file(app.state(), a.path))
+            ser(crate::files::create_file(app.state(), a.path).await)
         }
         "rename_item" => {
             let a: RenameItemArgs = parse_args(&raw)?;
-            ser(crate::files::rename_item(app.state(), a.from, a.to))
+            ser(crate::files::rename_item(app.state(), a.from, a.to).await)
         }
         "trash_item" => {
             let a: PathArgs = parse_args(&raw)?;
-            ser(crate::files::trash_item(app.state(), a.path))
+            ser(crate::files::trash_item(app.state(), a.path).await)
         }
         "duplicate_item" => {
             let a: PathArgs = parse_args(&raw)?;
-            ser(crate::files::duplicate_item(app.state(), a.path))
+            ser(crate::files::duplicate_item(app.state(), a.path).await)
         }
         "paste_item" => {
             let a: PasteItemArgs = parse_args(&raw)?;
-            ser(crate::files::paste_item(
-                app.state(),
-                a.source,
-                a.target_dir,
-            ))
+            ser(crate::files::paste_item(app.state(), a.source, a.target_dir).await)
         }
         "search_text" => {
             let a: SearchTextArgs = parse_args(&raw)?;
@@ -1028,8 +1050,14 @@ pub(super) async fn dispatch(
             let target = crate::memory::Target::parse(&a.target)
                 .map_err(|error| serde_json::to_string(&error).unwrap_or(error.message))?;
             memory_ser(
-                crate::memory::add(&app.state(), target, a.bot_id.as_deref(), &a.content, "user")
-                    .map(|(entry, _created)| entry),
+                crate::memory::add(
+                    &app.state(),
+                    target,
+                    a.bot_id.as_deref(),
+                    &a.content,
+                    "user",
+                )
+                .map(|(entry, _created)| entry),
             )
         }
         "memory_update" => {
@@ -1044,7 +1072,11 @@ pub(super) async fn dispatch(
             let a: MemoryClearArgs = parse_args(&raw)?;
             let target = crate::memory::Target::parse(&a.target)
                 .map_err(|error| serde_json::to_string(&error).unwrap_or(error.message))?;
-            memory_ser(crate::memory::clear(&app.state(), target, a.bot_id.as_deref()))
+            memory_ser(crate::memory::clear(
+                &app.state(),
+                target,
+                a.bot_id.as_deref(),
+            ))
         }
         "memory_pending_approve" => {
             let a: IdArgs = parse_args(&raw)?;
@@ -1137,61 +1169,61 @@ pub(super) async fn dispatch(
         // git
         "git_status" => {
             let a: PathArgs = parse_args(&raw)?;
-            ser(crate::git::git_status(a.path).await)
+            ser(crate::git::git_status(app.state(), a.path).await)
         }
         "git_repository_summaries" => {
             let a: PathsArgs = parse_args(&raw)?;
-            ser(Ok(crate::git::git_repository_summaries(a.paths).await))
+            ser(crate::git::git_repository_summaries(app.state(), a.paths).await)
         }
         "git_file_colors" => {
             let a: GitFilesArgs = parse_args(&raw)?;
-            ser(crate::git::git_file_colors(a.path, a.files).await)
+            ser(crate::git::git_file_colors(app.state(), a.path, a.files).await)
         }
         "git_tree_status" => {
             let a: GitTreeArgs = parse_args(&raw)?;
-            ser(crate::git::git_tree_status(a.levels).await)
+            ser(crate::git::git_tree_status(app.state(), a.levels).await)
         }
         "git_diff" => {
             let a: GitDiffArgs = parse_args(&raw)?;
-            ser(crate::git::git_diff(a.path, a.file, a.staged).await)
+            ser(crate::git::git_diff(app.state(), a.path, a.file, a.staged).await)
         }
         "git_stage" => {
             let a: GitFilesArgs = parse_args(&raw)?;
-            ser(crate::git::git_stage(a.path, a.files))
+            ser(crate::git::git_stage(app.state(), a.path, a.files).await)
         }
         "git_unstage" => {
             let a: GitFilesArgs = parse_args(&raw)?;
-            ser(crate::git::git_unstage(a.path, a.files))
+            ser(crate::git::git_unstage(app.state(), a.path, a.files).await)
         }
         // Same shared changes panel as the desktop, so the remote client's
         // 「撤销更改」 must route too (it falls through to unknown otherwise).
         "git_discard" => {
             let a: GitFilesArgs = parse_args(&raw)?;
-            ser(crate::git::git_discard(a.path, a.files))
+            ser(crate::git::git_discard(app.state(), a.path, a.files).await)
         }
         "git_commit" => {
             let a: GitCommitArgs = parse_args(&raw)?;
-            ser(crate::git::git_commit(a.path, a.message))
+            ser(crate::git::git_commit(app.state(), a.path, a.message).await)
         }
         "git_push" => {
             let a: PathArgs = parse_args(&raw)?;
-            ser(crate::git::git_push(a.path).await)
+            ser(crate::git::git_push(app.state(), a.path).await)
         }
         "git_pull" => {
             let a: PathArgs = parse_args(&raw)?;
-            ser(crate::git::git_pull(a.path).await)
+            ser(crate::git::git_pull(app.state(), a.path).await)
         }
         "git_branches" => {
             let a: PathArgs = parse_args(&raw)?;
-            ser(crate::git::git_branches(a.path))
+            ser(crate::git::git_branches(app.state(), a.path).await)
         }
         "git_checkout" => {
             let a: GitCheckoutArgs = parse_args(&raw)?;
-            ser(crate::git::git_checkout(a.path, a.branch))
+            ser(crate::git::git_checkout(app.state(), a.path, a.branch).await)
         }
         "git_create_branch" => {
             let a: GitCreateBranchArgs = parse_args(&raw)?;
-            ser(crate::git::git_create_branch(a.path, a.name))
+            ser(crate::git::git_create_branch(app.state(), a.path, a.name).await)
         }
         // open-app
         "open_workspace_in" => {
@@ -1253,7 +1285,10 @@ pub(super) async fn dispatch(
         "web_relay_stop" => ser(crate::relay::web_relay_stop(app.clone())),
         "web_relay_unattended" => {
             let a: RelayUnattendedArgs = parse_args(&raw)?;
-            ser(crate::relay::web_relay_unattended_set(app.clone(), a.enabled))
+            ser(crate::relay::web_relay_unattended_set(
+                app.clone(),
+                a.enabled,
+            ))
         }
         "relay_deploy_pack" => {
             let a: RelayDeployPackArgs = parse_args(&raw)?;
@@ -1300,11 +1335,16 @@ pub(super) async fn dispatch(
         }
         "plugin_asset_list_directories" => {
             let a: PluginAssetIdArgs = parse_args(&raw)?;
-            ser(crate::plugins::assets::plugin_asset_list_directories(a.plugin_id))
+            ser(crate::plugins::assets::plugin_asset_list_directories(
+                a.plugin_id,
+            ))
         }
         "plugin_asset_revoke_directory" => {
             let a: PluginAssetRevokeArgs = parse_args(&raw)?;
-            ser(crate::plugins::assets::plugin_asset_revoke_directory(a.plugin_id, a.grant_id))
+            ser(crate::plugins::assets::plugin_asset_revoke_directory(
+                a.plugin_id,
+                a.grant_id,
+            ))
         }
         "plugin_reveal_path" => {
             let a: PluginAssetPathArgs = parse_args(&raw)?;

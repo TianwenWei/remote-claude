@@ -3,7 +3,8 @@
  *  - 未安装(本机探针 available=false)的引擎不出现;
  *  - 接管工作区(allowedEngines 非 null,由 workspace-ui 桥提供)只留列表内
  *    的 CLI,可用态按列表内与否,不按本机 `command -v`。 */
-import type { EngineInfo } from "@/lib/ipc";
+import type { EngineInfo, Workspace } from "@/lib/ipc";
+import { sshWorkspaceMetaOf } from "@/lib/ssh-workspace";
 import { orderByStoredKeys } from "@/lib/cli-nav-order";
 
 export interface EngineOption {
@@ -12,6 +13,13 @@ export interface EngineOption {
   available: boolean;
   disabled: boolean;
   disabledReason: string;
+}
+
+/** Native SSH metadata is an allow-list even when no supported remote CLI
+ * was discovered; never fall back to running local engines in that case. */
+export function sshWorkspaceAllowedEngines(workspace?: Workspace): string[] | null {
+  const ssh = sshWorkspaceMetaOf(workspace);
+  return ssh ? (ssh.enginePaths.claude ? ["claude"] : []) : null;
 }
 
 export function filterEngineOptions(

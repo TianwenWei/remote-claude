@@ -212,8 +212,9 @@ pub async fn terminal_open(
             ));
         }
     }
+    let remote = crate::engine::wsl_transport::transport_for_path(&state.db, &cwd)?;
     let cwd_path = std::path::Path::new(&cwd);
-    if !cwd_path.is_dir() {
+    if remote.is_none() && !cwd_path.is_dir() {
         return Err(format!("terminal cwd does not exist: {cwd}"));
     }
 
@@ -227,11 +228,7 @@ pub async fn terminal_open(
         })
         .map_err(|e| format!("failed to open pty: {e}"))?;
 
-    let mut cmd = CommandBuilder::new(resolve_shell_path());
-    cmd.cwd(cwd_path);
-    // `-i` for an interactive shell (aliases, prompt). N/A for cmd.exe.
-    #[cfg(not(windows))]
-    cmd.arg("-i");
+    let mut cmd = terminal_command(&cwd, remote.as_ref());
     cmd.env("TERM", "xterm-256color");
     cmd.env("COLORTERM", "truecolor");
     let locale = resolve_locale();
@@ -276,6 +273,35 @@ pub async fn terminal_open(
         reader,
     );
     Ok(())
+}
+
+fn terminal_command(
+    cwd: &str,
+    remote: Option<&crate::engine::wsl_transport::WslTransport>,
+) -> CommandBuilder {
+    if let Some(transport) = remote {
+        let ssh = crate::engine::wsl_transport::base_ssh_command(transport);
+        let source = ssh.as_std();
+        let mut cmd = CommandBuilder::new(source.get_program());
+        // Force a remote PTY so resizing, Ctrl-C, and interactive programs
+        // retain their terminal semantics through the local PTY.
+        cmd.arg("-tt");
+        cmd.args(source.get_args());
+        let script = format!(
+            "cd -- {} && exec bash -l",
+            crate::engine::wsl_transport::sh_quote(cwd)
+        );
+        cmd.arg(crate::engine::wsl_transport::remote_command_string(
+            transport,
+            &["bash", "-lc", &script],
+        ));
+        return cmd;
+    }
+    let mut cmd = CommandBuilder::new(resolve_shell_path());
+    cmd.cwd(cwd);
+    #[cfg(not(windows))]
+    cmd.arg("-i");
+    cmd
 }
 
 #[tauri::command]

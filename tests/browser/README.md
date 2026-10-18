@@ -1,5 +1,25 @@
 # Chat streaming regression
 
+Open `/tests/browser/ssh-onboarding.html` for the production native SSH setup
+card against an in-memory fake Tauri transport. A fresh form must have empty
+host, user and private-key path, port 22, and remote directory `~`. Use
+`server.example` / `demo`, connect, and verify that no directory probe happens
+before checking the external-fingerprint verification box and explicitly
+trusting the displayed demo key. Trust then reveals browsable folders and
+enables project registration. The private-key picker returns a synthetic
+absolute path without opening a real dialog or reading a file.
+
+Switch the fixture scenario to changed host key, missing Python 3, or signed-out
+Claude: conflicting keys must prevent trust/authentication, and missing required
+tools or login must leave registration disabled with a visible explanation.
+Each scenario switch and reset starts a new blank form; the JSON readout shows
+only simulated command counts and project state. Chinese/English can be checked
+on the same real card. Both localStorage and sessionStorage are replaced with
+page-only memory before importing any stores. No SSH, model, real native IPC,
+private key, saved conversation or external network request is used; only the
+local Vite server supplies frontend modules/assets. This fixture verifies
+browser interaction and rendering, not native host-key security or live SSH.
+
 Open `/tests/browser/interface-typography.html` for the real General settings
 controls with in-memory persistence. Expand Advanced and change the UI,
 content and code sizes independently using px inputs (blur or Enter to save).

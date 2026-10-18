@@ -157,7 +157,7 @@ function AddProgramDialog({
   );
 }
 
-export function HeaderOpenActions({ workspacePath }: { workspacePath: string }) {
+export function HeaderOpenActions({ workspacePath, remote = false }: { workspacePath: string; remote?: boolean }) {
   const { t } = useTranslation();
   // Editors open the file shown in the active editor tab; Finder always
   // reveals the workspace folder.
@@ -315,6 +315,14 @@ export function HeaderOpenActions({ workspacePath }: { workspacePath: string }) 
     );
   };
 
+  if (remote) return (
+    <div className="flex items-center gap-0.5 px-1.5">
+      <button type="button" title={terminalLabel} aria-label={terminalLabel} aria-pressed={terminalOpen}
+        onClick={() => toggleTerminal(workspacePath)} className={ICON_BUTTON_CLASSES}>
+        <SquareTerminal className="size-4" aria-hidden />
+      </button>
+    </div>
+  );
   return (
     <div className="flex items-center gap-0.5 px-1.5">
       {openError && (

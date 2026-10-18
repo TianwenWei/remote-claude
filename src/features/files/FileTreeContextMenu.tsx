@@ -12,6 +12,8 @@ import Search from "lucide-react/dist/esm/icons/search";
 import Trash2 from "lucide-react/dist/esm/icons/trash-2";
 import { ContextMenu, type ContextMenuEntry } from "@/components/context-menu";
 import { parentPath } from "./store";
+import { useChatStore } from "@/features/chat/store";
+import { isSshWorkspacePath } from "@/lib/ssh-workspace";
 
 export interface FileTreeMenuState {
   x: number;
@@ -58,6 +60,7 @@ export function FileTreeContextMenu({
   onTrash: () => void;
 }) {
   const { t } = useTranslation();
+  const remote = useChatStore((state) => isSshWorkspacePath(state.workspaces, menu.path));
 
   const isMac = navigator.platform.includes("Mac");
   const isWindows = navigator.platform.includes("Win");
@@ -83,7 +86,7 @@ export function FileTreeContextMenu({
     { id: "rename", label: t("files.renameItem"), icon: <Pencil className="size-4" aria-hidden />, onSelect: onRename },
     { id: "copy-path", label: t("files.copyPath"), icon: <Link2 className="size-4" aria-hidden />, onSelect: onCopyPath },
     { id: "send-path", label: t("files.sendPathToComposer"), icon: <MessageSquarePlus className="size-4" aria-hidden />, onSelect: onSendPath },
-    { id: "reveal", label: revealLabel, icon: <FolderOpen className="size-4" aria-hidden />, onSelect: onReveal },
+    ...(remote ? [] : [{ id: "reveal", label: revealLabel, icon: <FolderOpen className="size-4" aria-hidden />, onSelect: onReveal }]),
     "separator",
     { id: "trash", label: t("files.deleteItem"), icon: <Trash2 className="size-4" aria-hidden />, danger: true, onSelect: onTrash },
   ];

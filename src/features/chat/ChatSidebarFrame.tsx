@@ -27,6 +27,7 @@ export function ChatSidebarFrame({
   onThreadAction,
   onCopyThreadId,
   onAddWorkspace,
+  onNewRemoteProject,
   onRemoveWorkspace,
   onWorkspaceAlias,
   onSetWorkspaceArchived,
@@ -57,6 +58,7 @@ export function ChatSidebarFrame({
   onThreadAction: (id: string, action: ThreadAction) => void;
   onCopyThreadId: (id: string) => void;
   onAddWorkspace: () => void;
+  onNewRemoteProject: () => void;
   onRemoveWorkspace: (workspaceId: string) => void;
   onWorkspaceAlias: (workspaceId: string) => void;
   onSetWorkspaceArchived: (workspaceId: string, archived: boolean) => void;
@@ -106,6 +108,7 @@ export function ChatSidebarFrame({
         onThreadAction={onThreadAction}
         onCopyThreadId={onCopyThreadId}
         onAddWorkspace={onAddWorkspace}
+        onNewRemoteProject={onNewRemoteProject}
         onRemoveWorkspace={onRemoveWorkspace}
         onWorkspaceAlias={onWorkspaceAlias}
         onSetWorkspaceArchived={onSetWorkspaceArchived}

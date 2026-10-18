@@ -1,5 +1,6 @@
 use std::path::PathBuf;
 
+#[cfg(not(feature = "remote-vps"))]
 fn read_portable_app_home() -> Option<PathBuf> {
     let exe_dir = std::env::current_exe().ok()?.parent()?.to_path_buf();
     let path = exe_dir.join("portable-data.json");
@@ -30,6 +31,7 @@ fn read_portable_app_home() -> Option<PathBuf> {
 /// pointer file sits next to the exe), and app_home() has ~40 callers —
 /// several on per-IPC paths — so an uncached disk read + JSON parse on every
 /// call is pure waste.
+#[cfg(not(feature = "remote-vps"))]
 static PORTABLE_HOME: std::sync::LazyLock<Option<PathBuf>> =
     std::sync::LazyLock::new(read_portable_app_home);
 
@@ -65,10 +67,17 @@ pub(crate) static HOME_ENV_LOCK: parking_lot::Mutex<()> = parking_lot::Mutex::ne
 
 /// Application home directory: ~/.ccgui-next/
 pub fn app_home() -> PathBuf {
-    if let Some(path) = PORTABLE_HOME.as_ref() {
-        return path.clone();
+    #[cfg(feature = "remote-vps")]
+    {
+        return home_dir().join(".ccgui-remote-vps");
     }
-    home_dir().join(".ccgui-next")
+    #[cfg(not(feature = "remote-vps"))]
+    {
+        if let Some(path) = PORTABLE_HOME.as_ref() {
+            return path.clone();
+        }
+        home_dir().join(".ccgui-next")
+    }
 }
 
 pub fn legacy_home() -> PathBuf {

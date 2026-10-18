@@ -14,7 +14,7 @@ pub(super) async fn pi_family_catalog_remote(
         return EngineCatalog::authoritative_remote(Vec::new());
     };
     let script = format!("cd {cwd} 2>/dev/null; {bin} models --json");
-    match crate::engine::wsl_transport::run_script_output(transport, &script).await {
+    match crate::engine::wsl_transport::run_readonly_script_output(transport, &script).await {
         Ok(stdout) => match pi::parse_models_json(&stdout) {
             Ok(models) if !models.is_empty() => EngineCatalog::authoritative_remote(models),
             _ => EngineCatalog::authoritative_remote(Vec::new()),
@@ -30,7 +30,7 @@ pub(super) async fn codex_catalog_remote(transport: &WslTransport) -> EngineCata
         return EngineCatalog::authoritative_remote(Vec::new());
     };
     let script = format!("cd {cwd} 2>/dev/null; {bin} debug models 2>/dev/null");
-    if let Ok(stdout) = crate::engine::wsl_transport::run_script_output(transport, &script).await {
+    if let Ok(stdout) = crate::engine::wsl_transport::run_readonly_script_output(transport, &script).await {
         if let Ok(models) = super::codex::parse_codex_models_json(&stdout) {
             if !models.is_empty() {
                 return EngineCatalog::authoritative_remote(super::with_default_first(
@@ -55,7 +55,7 @@ pub(super) async fn kimi_catalog_remote(transport: &WslTransport) -> EngineCatal
     };
     let script = format!("cd {cwd} 2>/dev/null; {bin} provider list --json 2>/dev/null");
     let default = kimi_config_model_remote(transport).await;
-    if let Ok(stdout) = crate::engine::wsl_transport::run_script_output(transport, &script).await {
+    if let Ok(stdout) = crate::engine::wsl_transport::run_readonly_script_output(transport, &script).await {
         let models = super::kimi::parse_kimi_provider_list(&stdout);
         if !models.is_empty() {
             // 与本机 kimi_catalog 同语义:配置默认置顶(pick 重置以首项为
@@ -70,7 +70,7 @@ pub(super) async fn kimi_catalog_remote(transport: &WslTransport) -> EngineCatal
 /// `default_model = "…"`:provider list 失败时唯一可跑的条目。
 async fn kimi_config_model_remote(transport: &WslTransport) -> Option<EngineModel> {
     let script = r#"cat "${KIMI_CODE_HOME:-$HOME/.kimi-code}/config.toml" 2>/dev/null"#;
-    let content = crate::engine::wsl_transport::run_script_output(transport, script)
+    let content = crate::engine::wsl_transport::run_readonly_script_output(transport, script)
         .await
         .ok()?;
     let model = super::parse_top_level_toml_string(&content, "default_model")?;
@@ -91,9 +91,9 @@ pub(super) async fn claude_catalog_remote(transport: &WslTransport) -> EngineCat
     // 取首次出现会把 user settings 后半截当 local 合并,优先级错乱。
     let sep = format!("=CCGUI_SEP_{}=", uuid::Uuid::new_v4().simple());
     let script = format!(
-        r#"d="${{CLAUDE_CONFIG_DIR:-$HOME/.claude}}"; cat "$d/settings.json" 2>/dev/null; echo "{sep}"; cat "$d/settings.local.json" 2>/dev/null"#
+        r#"d="${{CLAUDE_CONFIG_DIR:-$HOME/.claude}}"; cat "$d/settings.json" 2>/dev/null || true; echo "{sep}"; cat "$d/settings.local.json" 2>/dev/null || true"#
     );
-    let out = crate::engine::wsl_transport::run_script_output(transport, &script)
+    let out = crate::engine::wsl_transport::run_readonly_script_output(transport, &script)
         .await
         .unwrap_or_default();
     let (user, local) = match out.split_once(&sep) {
@@ -113,7 +113,7 @@ fn bin_for(transport: &WslTransport, engine: &str) -> Option<String> {
 /// 发行版内 `$CODEX_HOME/config.toml`(默认 ~/.codex)的顶层 model=。
 async fn codex_config_model_remote(transport: &WslTransport) -> Option<EngineModel> {
     let script = r#"cat "${CODEX_HOME:-$HOME/.codex}/config.toml" 2>/dev/null"#;
-    let content = crate::engine::wsl_transport::run_script_output(transport, script)
+    let content = crate::engine::wsl_transport::run_readonly_script_output(transport, script)
         .await
         .ok()?;
     let model = super::parse_top_level_toml_string(&content, "model")?;
@@ -131,6 +131,10 @@ async fn codex_config_model_remote(transport: &WslTransport) -> Option<EngineMod
 /// 拿违例路径发脚本(此前 catalog 路径绕过白名单直排,是注入面)。
 fn remote_cwd(transport: &WslTransport) -> Option<String> {
     match &transport.workspace {
+        Some(ws) if transport.distro.is_empty() => {
+            crate::engine::wsl_transport::is_safe_linux_path(ws)
+                .then(|| crate::engine::wsl_transport::sh_quote(ws))
+        }
         Some(ws) => crate::engine::wsl_transport::is_safe_workspace(ws).then(|| ws.clone()),
         None => Some("~".to_string()),
     }
@@ -171,6 +175,7 @@ mod tests {
             user: "dev".into(),
             distro: "Ubuntu".into(),
             control_path: None,
+            identity_file: None,
             engine_paths: Default::default(),
             workspace: workspace.map(str::to_string),
         }

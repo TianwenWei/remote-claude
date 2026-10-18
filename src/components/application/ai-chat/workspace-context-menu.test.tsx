@@ -4,6 +4,8 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { workspaceMenuRegistry, type Disposer } from "@ccgui/plugin-sdk";
 import i18n from "@/lib/i18n";
 import { WorkspaceContextMenu } from "./workspace-context-menu";
+import { useChatStore } from "@/features/chat/store";
+import type { Workspace } from "@/lib/ipc";
 
 (globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
 
@@ -19,6 +21,7 @@ describe("workspace menu plugin isolation", () => {
   const menu = { x: 10, y: 10, workspaceId: "menu-workspace", archived: false };
 
   beforeEach(() => {
+    useChatStore.setState({ workspaces: [] });
     disposers = [];
     container = document.createElement("div");
     document.body.appendChild(container);
@@ -35,6 +38,15 @@ describe("workspace menu plugin isolation", () => {
   function menuItems(): HTMLButtonElement[] {
     return [...document.querySelectorAll<HTMLButtonElement>('[role="menuitem"]')];
   }
+
+  it("hides local worktree management for an SSH workspace", () => {
+    useChatStore.setState({ workspaces: [{ id: menu.workspaceId, path: "/home/cc/project", meta: { ssh: {
+      host: "vps", user: "cc", port: 22, identityFile: null, workspace: "/home/cc/project", enginePaths: { claude: "/usr/bin/claude" },
+    } } } as unknown as Workspace] });
+    act(() => root.render(<WorkspaceContextMenu menu={menu} onClose={() => {}} onSetAlias={() => {}} onNewWorktree={() => {}} />));
+    expect(menuItems().some((button) => button.textContent === i18n.t("worktree.newWorktree"))).toBe(false);
+    expect(menuItems().some((button) => button.textContent === i18n.t("chat.setWorkspaceAlias"))).toBe(true);
+  });
 
   it("keeps the workspace alias action usable when a plugin icon crashes", () => {
     const BrokenIcon = () => {

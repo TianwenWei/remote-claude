@@ -1,5 +1,8 @@
 use base64::Engine as _;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
+
+#[path = "remote_project.rs"]
+pub(crate) mod remote;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -10,7 +13,7 @@ const MAX_SEARCH_RESULTS: usize = 200;
 /// filter drops build output, the cap is the last line of defense).
 const MAX_INDEX_ENTRIES: usize = 20_000;
 
-#[derive(Serialize)]
+#[derive(Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DirEntry {
     pub name: String,
@@ -19,7 +22,7 @@ pub struct DirEntry {
     pub mtime_ms: i64,
 }
 
-#[derive(Serialize)]
+#[derive(Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct FileContent {
     pub kind: String, // "text" | "image" | "binary"
@@ -28,14 +31,14 @@ pub struct FileContent {
     pub truncated: bool,
 }
 
-#[derive(Serialize)]
+#[derive(Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SearchHit {
     pub path: String,
     pub line: usize,
     pub text: String,
 }
-#[derive(Serialize)]
+#[derive(Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct FileIndexEntry {
     /// Workspace-relative path, "/" separators (the frontend re-joins it
@@ -165,10 +168,20 @@ pub fn revoke_granted_root(
 }
 
 #[tauri::command]
-pub fn list_dir(
+pub async fn list_dir(
     db: tauri::State<'_, Arc<crate::db::Db>>,
     path: String,
 ) -> Result<Vec<DirEntry>, String> {
+    let db = Arc::clone(db.inner());
+    tauri::async_runtime::spawn_blocking(move || list_dir_blocking(&db, path))
+        .await
+        .map_err(|error| error.to_string())?
+}
+
+fn list_dir_blocking(db: &crate::db::Db, path: String) -> Result<Vec<DirEntry>, String> {
+    if let Some(value) = remote::call(&db, &path, "list_dir", serde_json::json!({}))? {
+        return Ok(value);
+    }
     let dir = ensure_allowed(&path, &db)?;
     let entries = std::fs::read_dir(&dir).map_err(|e| format!("read {}: {e}", dir.display()))?;
     let mut out: Vec<DirEntry> = entries
@@ -219,6 +232,9 @@ fn image_mime(path: &Path) -> &'static str {
 /// Sync body of `read_file`; the command wrapper runs it off the main
 /// thread via spawn_blocking (a 1MB read must not stall IPC).
 fn read_file_blocking(db: &crate::db::Db, path: &str) -> Result<FileContent, String> {
+    if let Some(value) = remote::call(db, path, "read_file", serde_json::json!({}))? {
+        return Ok(value);
+    }
     let file = ensure_allowed(path, db)?;
     let meta = std::fs::metadata(&file).map_err(|e| format!("stat {}: {e}", file.display()))?;
     if is_image(&file) {
@@ -280,24 +296,65 @@ pub async fn read_file(
 }
 
 #[tauri::command]
-pub fn write_file(
+pub async fn write_file(
     db: tauri::State<'_, Arc<crate::db::Db>>,
     path: String,
     content: String,
 ) -> Result<(), String> {
+    let db = Arc::clone(db.inner());
+    tauri::async_runtime::spawn_blocking(move || write_file_blocking(&db, path, content))
+        .await
+        .map_err(|error| error.to_string())?
+}
+
+fn write_file_blocking(db: &crate::db::Db, path: String, content: String) -> Result<(), String> {
+    if let Some(value) = remote::call(
+        &db,
+        &path,
+        "write_file",
+        serde_json::json!({"content": content}),
+    )? {
+        return Ok(value);
+    }
     let file = ensure_allowed(&path, &db)?;
     std::fs::write(&file, content).map_err(|e| format!("write {}: {e}", file.display()))
 }
 
 #[tauri::command]
-pub fn create_dir(db: tauri::State<'_, Arc<crate::db::Db>>, path: String) -> Result<(), String> {
+pub async fn create_dir(
+    db: tauri::State<'_, Arc<crate::db::Db>>,
+    path: String,
+) -> Result<(), String> {
+    let db = Arc::clone(db.inner());
+    tauri::async_runtime::spawn_blocking(move || create_dir_blocking(&db, path))
+        .await
+        .map_err(|error| error.to_string())?
+}
+
+fn create_dir_blocking(db: &crate::db::Db, path: String) -> Result<(), String> {
+    if let Some(value) = remote::call(&db, &path, "create_dir", serde_json::json!({}))? {
+        return Ok(value);
+    }
     let dir = ensure_allowed(&path, &db)?;
     std::fs::create_dir_all(&dir).map_err(|e| format!("mkdir {}: {e}", dir.display()))
 }
 /// "New file" from the tree context menu: `create_new` fails instead of
 /// clobbering when the name is taken (write_file overwrites by design).
 #[tauri::command]
-pub fn create_file(db: tauri::State<'_, Arc<crate::db::Db>>, path: String) -> Result<(), String> {
+pub async fn create_file(
+    db: tauri::State<'_, Arc<crate::db::Db>>,
+    path: String,
+) -> Result<(), String> {
+    let db = Arc::clone(db.inner());
+    tauri::async_runtime::spawn_blocking(move || create_file_blocking(&db, path))
+        .await
+        .map_err(|error| error.to_string())?
+}
+
+fn create_file_blocking(db: &crate::db::Db, path: String) -> Result<(), String> {
+    if let Some(value) = remote::call(&db, &path, "create_file", serde_json::json!({}))? {
+        return Ok(value);
+    }
     let file = ensure_allowed(&path, &db)?;
     std::fs::OpenOptions::new()
         .write(true)
@@ -308,11 +365,22 @@ pub fn create_file(db: tauri::State<'_, Arc<crate::db::Db>>, path: String) -> Re
 }
 
 #[tauri::command]
-pub fn rename_item(
+pub async fn rename_item(
     db: tauri::State<'_, Arc<crate::db::Db>>,
     from: String,
     to: String,
 ) -> Result<(), String> {
+    let db = Arc::clone(db.inner());
+    tauri::async_runtime::spawn_blocking(move || rename_item_blocking(&db, from, to))
+        .await
+        .map_err(|error| error.to_string())?
+}
+
+fn rename_item_blocking(db: &crate::db::Db, from: String, to: String) -> Result<(), String> {
+    if let Some(value) = remote::call(&db, &from, "rename", serde_json::json!({"to": to}))? {
+        return Ok(value);
+    }
+    remote::reject_cross_remote_target(&db, &to)?;
     let src = ensure_allowed(&from, &db)?;
     let dst = ensure_allowed(&to, &db)?;
     std::fs::rename(&src, &dst)
@@ -320,11 +388,24 @@ pub fn rename_item(
 }
 
 #[tauri::command]
-pub fn trash_item(db: tauri::State<'_, Arc<crate::db::Db>>, path: String) -> Result<(), String> {
+pub async fn trash_item(
+    db: tauri::State<'_, Arc<crate::db::Db>>,
+    path: String,
+) -> Result<(), String> {
+    let db = Arc::clone(db.inner());
+    tauri::async_runtime::spawn_blocking(move || trash_item_blocking(&db, path))
+        .await
+        .map_err(|error| error.to_string())?
+}
+
+fn trash_item_blocking(db: &crate::db::Db, path: String) -> Result<(), String> {
+    if let Some(value) = remote::call(&db, &path, "trash", serde_json::json!({}))? {
+        return Ok(value);
+    }
     let target = ensure_allowed(&path, &db)?;
     trash::delete(&target).map_err(|e| format!("trash {}: {e}", target.display()))
 }
-#[derive(Serialize)]
+#[derive(Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct FileOpResult {
     pub path: String,
@@ -410,10 +491,20 @@ fn copy_item_into_dir(
 }
 
 #[tauri::command]
-pub fn duplicate_item(
+pub async fn duplicate_item(
     db: tauri::State<'_, Arc<crate::db::Db>>,
     path: String,
 ) -> Result<FileOpResult, String> {
+    let db = Arc::clone(db.inner());
+    tauri::async_runtime::spawn_blocking(move || duplicate_item_blocking(&db, path))
+        .await
+        .map_err(|error| error.to_string())?
+}
+
+fn duplicate_item_blocking(db: &crate::db::Db, path: String) -> Result<FileOpResult, String> {
+    if let Some(value) = remote::call(&db, &path, "duplicate", serde_json::json!({}))? {
+        return Ok(value);
+    }
     let source = ensure_allowed(&path, &db)?;
     let meta = std::fs::symlink_metadata(&source)
         .map_err(|e| format!("stat {}: {e}", source.display()))?;
@@ -431,11 +522,27 @@ pub fn duplicate_item(
 }
 
 #[tauri::command]
-pub fn paste_item(
+pub async fn paste_item(
     db: tauri::State<'_, Arc<crate::db::Db>>,
     source: String,
     target_dir: String,
 ) -> Result<FileOpResult, String> {
+    let db = Arc::clone(db.inner());
+    tauri::async_runtime::spawn_blocking(move || paste_item_blocking(&db, source, target_dir))
+        .await
+        .map_err(|error| error.to_string())?
+}
+
+fn paste_item_blocking(
+    db: &crate::db::Db,
+    source: String,
+    target_dir: String,
+) -> Result<FileOpResult, String> {
+    if let Some(value) = remote::call(&db, &source, "paste", serde_json::json!({"to": target_dir}))?
+    {
+        return Ok(value);
+    }
+    remote::reject_cross_remote_target(&db, &target_dir)?;
     let source = ensure_allowed(&source, &db)?;
     let dir = ensure_allowed(&target_dir, &db)?;
     if !dir.is_dir() {
@@ -473,6 +580,9 @@ fn search_text_blocking(
     path: &str,
     query: &str,
 ) -> Result<Vec<SearchHit>, String> {
+    if let Some(value) = remote::call(db, path, "search", serde_json::json!({"query": query}))? {
+        return Ok(value);
+    }
     use std::io::BufRead;
     let root = ensure_allowed(path, db)?;
     let needle = query.trim().to_string();
@@ -557,6 +667,14 @@ fn list_file_index_blocking(
     path: &str,
     include_ignored: bool,
 ) -> Result<Vec<FileIndexEntry>, String> {
+    if let Some(value) = remote::call(
+        db,
+        path,
+        "index",
+        serde_json::json!({"includeIgnored": include_ignored}),
+    )? {
+        return Ok(value);
+    }
     let root = ensure_allowed(path, db)?;
     let mut out: Vec<FileIndexEntry> = Vec::new();
     let walker = ignore::WalkBuilder::new(&root)

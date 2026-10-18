@@ -12,6 +12,8 @@ pub(crate) fn resolve_claude_channel_model(
 ) -> Option<String> {
     claude_channel::resolve_model(selected, Some(provider), env)
 }
+#[cfg(feature = "remote-vps")]
+mod claude_permission;
 pub mod codex;
 mod codex_app;
 mod codex_provider_env;
@@ -41,7 +43,11 @@ pub mod qoder;
 mod qoder_session;
 mod reader;
 mod registry;
+pub mod remote_workspace;
+pub mod ssh_onboarding;
 pub mod resolve;
+mod ssh_rpc_pool;
+mod ssh_rpc_mux;
 pub mod wsl_transport;
 
 pub(crate) use resolve::command_for_binary;
@@ -539,8 +545,15 @@ fn prepare_launch(
     // 记忆工具注入的是本机 exe + 本机数据库,远端(WSL)CLI 拉不起来。
     // 发送时提示词快照已经冻结(里面写着「用 memory 工具」),所以这里显式
     // 拒绝,而不是挂一个起不来的服务器让模型自己发现工具不存在。
-    if wsl && memory_bot.as_deref().is_some_and(|id| !id.trim().is_empty()) {
+    if wsl
+        && memory_bot
+            .as_deref()
+            .is_some_and(|id| !id.trim().is_empty())
+    {
         return Err("记忆工具不支持远程工作区(WSL):注入的是本机程序".into());
+    }
+    if wsl && computer_use == Some(true) {
+        return Err("Computer use is unavailable in a remote workspace".into());
     }
     // 工具白名单是硬约束：引擎不能兑现就直接拒绝启动（不降级为无约束）。
     let allowed_tools = match allowed_tools {
@@ -562,8 +575,18 @@ fn prepare_launch(
         Some(_) => return Err("tool constraints must not be empty".into()),
         None => None,
     };
-    let provider_id = provider_id.filter(|s| !s.trim().is_empty());
-    let provider = crate::config::resolve_provider(engine, provider_id.as_deref())?;
+    // Remote CLIs own their credentials and model aliases. Local channel
+    // secrets, defaults and granted Mac directories cannot cross this link.
+    let provider_id = if wsl {
+        None
+    } else {
+        provider_id.filter(|s| !s.trim().is_empty())
+    };
+    let provider = if wsl {
+        None
+    } else {
+        crate::config::resolve_provider(engine, provider_id.as_deref())?
+    };
     let channel_env = provider
         .as_ref()
         .map(|p| crate::provider_files::channel_env(engine, p))
@@ -572,9 +595,13 @@ fn prepare_launch(
     let settings = crate::settings::read_settings().unwrap_or_default();
     let model = model
         .filter(|m| !m.trim().is_empty())
-        .or_else(|| settings.default_models.get(engine).cloned())
+        .or_else(|| {
+            (!wsl)
+                .then(|| settings.default_models.get(engine).cloned())
+                .flatten()
+        })
         .filter(|m| !m.trim().is_empty());
-    let model = if engine == "claude" {
+    let model = if engine == "claude" && !wsl {
         claude_channel::resolve_model(model.as_deref(), provider.as_ref(), &channel_env)
     } else {
         model
@@ -602,6 +629,7 @@ fn prepare_launch(
         // hand-edited db should not produce an argv bomb.
         additional_dirs: additional_dirs
             .into_iter()
+            .filter(|_| !wsl)
             .map(|d| d.trim().to_string())
             .filter(|d| !d.is_empty() && Path::new(d).is_absolute())
             .take(32)
@@ -624,7 +652,11 @@ fn prepare_launch(
             .filter(|_| engine_impl.supports_memory()),
         allowed_tools,
     };
-    let bin = engine_bin(&settings, engine);
+    let bin = if wsl {
+        cli_binary_name(engine).to_string()
+    } else {
+        engine_bin(&settings, engine)
+    };
     // Host-transport engines spawn through their driver instead: codex/grok
     // hand back the real app-server / ACP command the driver spawns verbatim
     // (channel flags and env land on it below, as for any child), while the
@@ -990,7 +1022,7 @@ async fn send_reserved(
     allowed_tools: Option<Vec<String>>,
 ) -> Result<SendResult, String> {
     // WSL 远程工作区:引擎进程经 ssh 在发行版内执行(见 wsl_transport)。
-    let wsl_tp = wsl_transport::transport_for_workspace(&state.db, &workspace_path);
+    let wsl_tp = wsl_transport::transport_for_path(&state.db, &workspace_path)?;
     let mut launch = prepare_launch(
         &engine,
         &workspace_path,
@@ -1376,6 +1408,31 @@ pub async fn answer_question(
         .get(&request_id)
         .cloned()
         .ok_or_else(|| "question is no longer pending".to_string())?;
+    #[cfg(feature = "remote-vps")]
+    if let Some(context) = input.get(claude_permission::CONTEXT_KEY) {
+        if entry.killed.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err("This session is stopping; tool permission is no longer available".into());
+        }
+        let frame = claude_permission::answer_frame(&request_id, context, answers.as_ref())?;
+        claude_permission::claim_answer(&entry.questions, &request_id)?;
+        if let Err(error) = state
+            .processes
+            .write_line(&session_id, frame.to_string())
+            .await
+        {
+            claude_permission::release_answer(&entry.questions, &request_id);
+            return Err(error);
+        }
+        if let Ok(mut questions) = entry.questions.lock() {
+            questions.remove(&request_id);
+        }
+        return Ok(());
+    }
+    #[cfg(feature = "remote-vps")]
+    let input = input
+        .get(claude_permission::QUESTION_KEY)
+        .cloned()
+        .unwrap_or(input);
     if let Some(context) = input.get("kimiAcp") {
         let frame = kimi_acp::answer_frame(context, answers.as_ref())?;
         state
@@ -1861,6 +1918,46 @@ mod permission_tests {
         for id in crate::config::ENGINES {
             assert!(engine_by_id(id).is_some(), "{id}");
         }
+    }
+
+    #[test]
+    fn remote_launch_uses_remote_credentials_binary_and_model_alias() {
+        let launch = prepare_launch(
+            "claude",
+            "/srv/remote",
+            None,
+            "hello".into(),
+            Vec::new(),
+            None,
+            None,
+            Some("opus".into()),
+            None,
+            Some("manual".into()),
+            vec!["/Users/local/private".into()],
+            Some("missing-local-provider".into()),
+            None,
+            None,
+            None,
+            true,
+        )
+        .unwrap();
+        assert_eq!(launch.bin, "claude");
+        assert_eq!(launch.req.model.as_deref(), Some("opus"));
+        assert!(launch.req.provider_id.is_none());
+        assert!(launch.req.additional_dirs.is_empty());
+        assert!(launch.built.keep_stdin_open);
+        let command = launch.built.command.as_std();
+        assert!(!command
+            .get_envs()
+            .any(|(key, _)| key.to_string_lossy().starts_with("ANTHROPIC_")));
+        let args: Vec<_> = command
+            .get_args()
+            .map(|arg| arg.to_string_lossy())
+            .collect();
+        assert!(args
+            .windows(2)
+            .any(|pair| pair == ["--permission-prompt-tool", "stdio"]));
+        assert!(!args.iter().any(|arg| arg.contains("/Users/local")));
     }
 
     /// 工具白名单是显式能力：只有实现了约束的引擎才允许被任务工作台

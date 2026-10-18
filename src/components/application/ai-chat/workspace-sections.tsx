@@ -6,6 +6,7 @@ import { useTranslation } from "react-i18next";
 import ChevronRight from "lucide-react/dist/esm/icons/chevron-right";
 import FolderPlus from "lucide-react/dist/esm/icons/folder-plus";
 import FolderSymlink from "lucide-react/dist/esm/icons/folder-symlink";
+import Server from "lucide-react/dist/esm/icons/server";
 import {
   WORKSPACE_DROP_TARGET_ATTR,
   WorkspaceSortableList,
@@ -13,6 +14,7 @@ import {
 import { ARCHIVED_SECTION_ID } from "@/components/application/ai-chat/use-sidebar-state";
 import { isWeb } from "@/lib/platform";
 import { Input } from "@/components/base/input/input";
+import { Button } from "@/components/base/buttons/button";
 import { RepoItem } from "@/components/application/ai-chat/repo-tree";
 import type { AiChatRepo, AiChatRepoSection, ThreadAction } from "@/components/application/ai-chat/sidebar-types";
 import { cx } from "@/utils/cx";
@@ -123,11 +125,18 @@ function ArchivedRepoRow({
       <span className="flex size-6 shrink-0 items-center justify-center" aria-hidden>
         <FolderSymlink className="size-4 text-foreground-icon-tertiary" />
       </span>
-      <span
-        title={repo.originalLabel}
-        className="min-w-0 flex-1 truncate text-body-2-medium whitespace-nowrap text-text-tertiary"
-      >
-        {repo.label}
+      <span className="min-w-0 flex-1">
+        <span
+          title={repo.originalLabel ?? repo.label}
+          className="block truncate text-body-2-medium whitespace-nowrap text-text-tertiary"
+        >
+          {repo.label}
+        </span>
+        {repo.labelDescription && (
+          <span title={repo.labelDescription} className="block truncate text-caption-2-regular text-text-tertiary">
+            {repo.labelDescription}
+          </span>
+        )}
       </span>
     </div>
   );
@@ -187,6 +196,7 @@ export function WorkspaceSection({
   onThreadAction,
   onThreadContextMenu,
   onAddWorkspace,
+  onNewRemoteProject,
   onRemoveWorkspace,
   onNewSessionInWorkspace,
   onNewWorktree,
@@ -212,6 +222,7 @@ export function WorkspaceSection({
   /** Right-click on a thread row (thread context menu). */
   onThreadContextMenu?: (event: ReactMouseEvent<HTMLElement>, threadId: string) => void;
   onAddWorkspace?: () => void;
+  onNewRemoteProject?: () => void;
   onRemoveWorkspace?: (id: string) => void;
   onNewSessionInWorkspace?: (id: string) => void;
   /** WORKTREES group ＋ / context-menu entry: open the create dialog. */
@@ -306,6 +317,11 @@ export function WorkspaceSection({
           </button>
         )}
       </div>
+      {!isWeb && onNewRemoteProject && (
+        <Button size="small" variant="ghost" leadingIcon={Server} className="w-full justify-start" onClick={onNewRemoteProject}>
+          {t("settings.sshNewProject")}
+        </Button>
+      )}
       {!hasGroups && renderRepoList(repos, null)}
       {hasGroups &&
         sections!.map((section) =>

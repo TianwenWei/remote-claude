@@ -39,3 +39,14 @@ CLAUDE.md
 # Local verification artifacts (CI bundles, screenshots) — distribute via
 # CI artifact attachments or release assets, never the git history.
 artifacts/
+__pycache__/
+*.pyc
+
+# Native iPhone build products and machine-specific Xcode state.
+ios/.build/
+ios/.swiftpm/
+ios/LocalSigning.xcconfig
+ios/DerivedData/
+ios/**/xcuserdata/
+ios/**/__pycache__/
+ios/**/*.pyc

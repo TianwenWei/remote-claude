@@ -1,5 +1,6 @@
 import { useEffect, useState } from "react";
 import { useTranslation } from "react-i18next";
+import { getName } from "@tauri-apps/api/app";
 import { Button } from "@/components/base/buttons/button";
 import {
   SettingsCard,
@@ -7,6 +8,7 @@ import {
   SettingsSectionLabel,
 } from "@/components/application/settings/settings-rows";
 import { getAppVersion } from "@/lib/platform";
+import { isWeb } from "@/lib/transport";
 import { useUpdateStore, type UpdateStage } from "@/features/update/store";
 import { useUpdateDescription } from "@/features/update/stage-message";
 
@@ -14,6 +16,7 @@ import { useUpdateDescription } from "@/features/update/stage-message";
 export function UpdateSection() {
   const { t } = useTranslation();
   const [version, setVersion] = useState<string | null>(null);
+  const [appName, setAppName] = useState("CC GUI");
   const updateStage = useUpdateStore((s) => s.stage);
   const updateVersion = useUpdateStore((s) => s.version);
   const downloadedBytes = useUpdateStore((s) => s.downloadedBytes);
@@ -49,6 +52,13 @@ export function UpdateSection() {
         if (!cancelled && v) setVersion(v);
       })
       .catch(() => {});
+    if (!isWeb) {
+      getName()
+        .then((name) => {
+          if (!cancelled && name) setAppName(name);
+        })
+        .catch(() => {});
+    }
     return () => {
       cancelled = true;
     };
@@ -60,7 +70,7 @@ export function UpdateSection() {
       <div className="flex w-full flex-col gap-2">
         <SettingsSectionLabel>{t("settings.checkUpdates")}</SettingsSectionLabel>
         <SettingsCard>
-          <SettingsRow anchor="appVersion" label="CC GUI" description={t("settings.aboutDesc")}>
+          <SettingsRow anchor="appVersion" label={appName} description={t("settings.aboutDesc")}>
             <span className="text-body-regular text-text-secondary">
               {version ? `v${version}` : "…"}
             </span>

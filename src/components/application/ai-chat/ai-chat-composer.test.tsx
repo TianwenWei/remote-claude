@@ -236,6 +236,29 @@ describe("代理快捷开关文案", () => {
     container.remove();
     vi.restoreAllMocks();
   });
+
+  it("shows unknown context usage without claiming zero usage or full free space", async () => {
+    vi.spyOn(ipc, "getAppSettings").mockResolvedValue({ systemProxyEnabled: false } as AppSettings);
+    await act(async () => root.render(<HashRouter><StatusBar contextMax={1_000_000} /></HashRouter>));
+    const trigger = container.querySelector<HTMLButtonElement>('button[aria-label="上下文窗口"]');
+    expect(trigger?.textContent).toContain("—");
+    expect(trigger?.textContent).not.toContain("0%");
+    const description = trigger?.getAttribute("aria-describedby");
+    expect(description && document.getElementById(description)?.textContent).toBe("暂未获取上下文用量");
+    await act(async () => trigger?.click());
+    const dialog = document.querySelector('[role="dialog"][aria-label="上下文窗口"]');
+    expect(dialog?.textContent).toContain("暂未获取上下文用量");
+    expect(dialog?.textContent).not.toContain("0%");
+    expect(dialog?.textContent).not.toContain("100%");
+  });
+
+  it("renders an authoritative zero percentage distinctly from unknown", async () => {
+    vi.spyOn(ipc, "getAppSettings").mockResolvedValue({ systemProxyEnabled: false } as AppSettings);
+    await act(async () => root.render(<HashRouter><StatusBar usagePct={0} /></HashRouter>));
+    const trigger = container.querySelector<HTMLButtonElement>('button[aria-label="上下文窗口"]');
+    expect(trigger?.textContent).toBe("0%");
+    expect(trigger?.getAttribute("aria-describedby")).toBeNull();
+  });
   // 回归：已配置地址但代理关闭时，按钮的 aria-label 必须落到真实文案上。
   // proxyOff/proxyTipOff 曾被误删而组件仍引用它们，纯函数测试发现不了——
   // 只有真的渲染这个状态才能钉住。代理开关挂在 StatusBar 上。

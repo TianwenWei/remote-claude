@@ -1,12 +1,14 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import { ipc, type SessionMeta } from "@/lib/ipc";
+import { ipc, type SessionMeta, type SessionPage, type Workspace } from "@/lib/ipc";
 import {
   pluginBus,
   resetPluginBusForTests,
   SESSION_ACTIVATED_TOPIC,
 } from "@/features/plugins/runtime/events";
 import { setPluginSessionEffort, useChatStore } from "./store";
-import { OPEN_TABS_KEY } from "./store/persistence";
+import { OPEN_TABS_KEY, persistTabs } from "./store/persistence";
+import { cacheSshSessionMetas, cachedSshSessionMetas } from "./store/ssh-session-catalog";
+import { CLI_CONFIG_CHANGED_EVENT } from "@/features/settings/providers";
 import { EMPTY_SESSION } from "./store/stream";
 import { handleEngineEvents, type EngineEventDeps } from "./store/engine-events";
 import { registerSessionHooks, registerTurnHooks } from "@/features/plugins/runtime/hooks";
@@ -19,12 +21,16 @@ vi.mock("@/lib/ipc", () => ({
     rememberSessionModel: vi.fn(async () => {}),
     rememberSessionEffort: vi.fn(async () => {}),
     listSessions: vi.fn(async () => []),
+    listWorkspaces: vi.fn(async () => []),
+    listEngines: vi.fn(async () => []),
+    listSshSessions: vi.fn(async () => []),
     listArchivedSessions: vi.fn(async () => []),
     listPlanReviews: vi.fn(async () => []),
     archiveSession: vi.fn(async () => {}),
     restoreSession: vi.fn(async () => {}),
     loadSessionPage: vi.fn(async () => ({ messages: [], nextBefore: null, subagentHistory: [] })),
     loadRemoteSessionPage: vi.fn(async () => ({ messages: [], nextBefore: null, subagentHistory: [] })),
+    loadCachedRemoteSessionPage: vi.fn(async () => null),
     deleteSession: vi.fn(async () => {}),
     deleteRemoteSession: vi.fn(async () => {}),
     getAppSettings: vi.fn(async () => ({})),
@@ -49,6 +55,9 @@ function resetStore() {
   vi.mocked(ipc.listArchivedSessions).mockResolvedValue([]);
   useChatStore.setState({
     openTabs: [],
+    workspaces: [],
+    sessions: [],
+    engines: [],
     active: null,
     activeEngine: "claude",
     models: { omp: "kimi-k3" },
@@ -75,6 +84,197 @@ function engineDeps(): EngineEventDeps {
     upsertSessionMeta: () => {},
   };
 }
+
+describe("session history loading", () => {
+  const remote: SessionMeta = {
+    engine: "claude", sessionId: "remote-history", workspacePath: WS,
+    filePath: "/home/cc/.claude/projects/demo/history.jsonl", fileSize: 2650000,
+    fileMtimeMs: 1, title: "remote", preview: "", createdAt: null,
+    updatedAt: 1, messageCount: 200, pinned: false, customTitle: null,
+    remote: true, remotePath: "/home/cc/.claude/projects/demo/history.jsonl",
+  };
+  const key = "claude/remote-history";
+  const page: SessionPage = {
+    messages: [{ seq: 1, role: "assistant", text: "Recovered history", ts: "2026-10-15T12:00:00Z" }],
+    nextBefore: 1, subagentHistory: [],
+  };
+
+  beforeEach(() => {
+    resetStore();
+    vi.mocked(ipc.loadRemoteSessionPage).mockReset().mockResolvedValue({ messages: [], nextBefore: null, subagentHistory: [] });
+    vi.mocked(ipc.loadCachedRemoteSessionPage).mockReset().mockResolvedValue(null);
+    useChatStore.setState({ sessions: [remote] });
+  });
+
+  it("activates an in-flight session again without starting a second history download", async () => {
+    const pending = Promise.withResolvers<SessionPage>();
+    vi.mocked(ipc.loadRemoteSessionPage).mockReturnValue(pending.promise);
+    const unrelated = { ...EMPTY_SESSION, error: "Other session error", activeModel: "other-model" };
+    useChatStore.setState({ bySession: { "claude/other": unrelated } });
+    const first = useChatStore.getState().selectSession(remote.engine, remote.sessionId, WS);
+    expect(useChatStore.getState().active?.sessionId).toBe(remote.sessionId);
+    expect(useChatStore.getState().bySession[key].loading).toBe(true);
+    useChatStore.getState().startNewChat("/tmp/other-workspace");
+    const reopened = useChatStore.getState().selectSession(remote.engine, remote.sessionId, WS);
+    expect(useChatStore.getState().active?.sessionId).toBe(remote.sessionId);
+    await vi.waitFor(() => expect(ipc.loadRemoteSessionPage).toHaveBeenCalledExactlyOnceWith(WS, "claude", remote.sessionId, remote.remotePath, 100, undefined));
+    pending.resolve(page);
+    await Promise.all([first, reopened]);
+    expect(useChatStore.getState().bySession[key]).toMatchObject({ loading: false, messages: page.messages });
+    expect(useChatStore.getState().bySession["claude/other"]).toBe(unrelated);
+  });
+
+  it("clears a prior timeout when retry starts and keeps it cleared after history arrives", async () => {
+    vi.mocked(ipc.loadRemoteSessionPage).mockRejectedValueOnce(new Error("Remote command timed out (30s)"));
+    await useChatStore.getState().selectSession(remote.engine, remote.sessionId, WS);
+    expect(useChatStore.getState().bySession[key]).toMatchObject({ loading: false, error: "Error: Remote command timed out (30s)" });
+    const pending = Promise.withResolvers<SessionPage>();
+    vi.mocked(ipc.loadRemoteSessionPage).mockReturnValueOnce(pending.promise);
+    useChatStore.setState((state) => ({ bySession: {
+      ...state.bySession, [key]: { ...state.bySession[key], activeModel: "session-model", activeEffort: "high", activeProvider: "session-provider" },
+    } }));
+    const retry = useChatStore.getState().selectSession(remote.engine, remote.sessionId, WS);
+    expect(useChatStore.getState().bySession[key]).toMatchObject({ loading: true, error: null });
+    pending.resolve(page);
+    await retry;
+    expect(useChatStore.getState().bySession[key]).toMatchObject({
+      loading: false, error: null, messages: page.messages,
+      activeModel: "session-model", activeEffort: "high", activeProvider: "session-provider",
+    });
+    expect(ipc.loadRemoteSessionPage).toHaveBeenCalledTimes(2);
+  });
+
+  it("preserves a newer session error reported while the history request is pending", async () => {
+    const pending = Promise.withResolvers<SessionPage>();
+    vi.mocked(ipc.loadRemoteSessionPage).mockReturnValueOnce(pending.promise);
+    useChatStore.setState({ bySession: { [key]: { ...EMPTY_SESSION, error: "Old timeout" } } });
+    const loading = useChatStore.getState().selectSession(remote.engine, remote.sessionId, WS);
+    useChatStore.setState((state) => ({ bySession: {
+      ...state.bySession, [key]: { ...state.bySession[key], error: "New runtime error", streaming: true, turnStartedAt: 123 },
+    } }));
+    pending.resolve(page);
+    await loading;
+    expect(useChatStore.getState().bySession[key]).toMatchObject({ loading: false, error: "New runtime error", streaming: true, turnStartedAt: 123 });
+  });
+
+  it("shows cached history before SSH completes, keeps it on failure and retries without blanking", async () => {
+    const pending = Promise.withResolvers<SessionPage>();
+    vi.mocked(ipc.loadCachedRemoteSessionPage).mockResolvedValueOnce({ page, cachedAt: 1000 });
+    vi.mocked(ipc.loadRemoteSessionPage).mockReturnValueOnce(pending.promise);
+    const opening = useChatStore.getState().selectSession(remote.engine, remote.sessionId, WS);
+    await vi.waitFor(() => expect(useChatStore.getState().bySession[key].messages).toEqual(page.messages));
+    expect(useChatStore.getState().bySession[key]).toMatchObject({ messages: page.messages, loading: false,
+      historyCache: { cachedAt: 1000, refreshing: true, refreshError: null } });
+    await useChatStore.getState().selectSession(remote.engine, remote.sessionId, WS);
+    expect(ipc.loadRemoteSessionPage).toHaveBeenCalledOnce();
+    pending.reject(new Error("Offline"));
+    await opening;
+    expect(useChatStore.getState().bySession[key]).toMatchObject({ messages: page.messages, error: null,
+      historyCache: { refreshing: false, refreshError: "Offline" } });
+    const refreshed = Promise.withResolvers<SessionPage>();
+    vi.mocked(ipc.loadRemoteSessionPage).mockReturnValueOnce(refreshed.promise);
+    const retry = useChatStore.getState().selectSession(remote.engine, remote.sessionId, WS);
+    expect(useChatStore.getState().bySession[key]).toMatchObject({ messages: page.messages,
+      historyCache: { refreshing: true, refreshError: null } });
+    refreshed.resolve({ ...page, messages: [{ ...page.messages[0], text: "Fresh history" }] });
+    await retry;
+    expect(useChatStore.getState().bySession[key]).toMatchObject({ historyCache: { updated: true, refreshing: false }, error: null });
+    expect(useChatStore.getState().bySession[key].messages[0].text).toBe("Fresh history");
+    expect(ipc.loadCachedRemoteSessionPage).toHaveBeenCalledOnce();
+  });
+
+  it("reads older cached pages offline and preserves them when the background tail refresh finishes", async () => {
+    const tail = { ...page, messages: [{ ...page.messages[0], seq: 101 }], nextBefore: 101 };
+    const earlier = { ...page, messages: [{ ...page.messages[0], seq: 1, text: "Older cached page" }], nextBefore: null };
+    vi.mocked(ipc.loadCachedRemoteSessionPage)
+      .mockResolvedValueOnce({ page: tail, cachedAt: 1000 })
+      .mockResolvedValueOnce({ page: earlier, cachedAt: 1000 });
+    const pending = Promise.withResolvers<SessionPage>();
+    vi.mocked(ipc.loadRemoteSessionPage).mockReturnValueOnce(pending.promise);
+    const opening = useChatStore.getState().selectSession(remote.engine, remote.sessionId, WS);
+    await vi.waitFor(() => expect(useChatStore.getState().bySession[key].messages).toEqual(tail.messages));
+    await useChatStore.getState().loadEarlier(key);
+    expect(ipc.loadCachedRemoteSessionPage).toHaveBeenLastCalledWith(WS, remote.engine, remote.sessionId, remote.remotePath, 100, 101);
+    expect(ipc.loadRemoteSessionPage).toHaveBeenCalledOnce();
+    expect(useChatStore.getState().bySession[key].messages.map((message) => message.seq)).toEqual([1, 101]);
+    pending.resolve({ ...tail, messages: [{ ...tail.messages[0], text: "Updated tail" }] });
+    await opening;
+    expect(useChatStore.getState().bySession[key].messages.map((message) => message.text)).toEqual(["Older cached page", "Updated tail"]);
+    expect(useChatStore.getState().bySession[key].nextBefore).toBeNull();
+  });
+
+  it("preserves a new turn that finishes while an older remote snapshot is downloading", async () => {
+    vi.mocked(ipc.loadCachedRemoteSessionPage).mockResolvedValueOnce({ page, cachedAt: 1000 });
+    const pending = Promise.withResolvers<SessionPage>();
+    vi.mocked(ipc.loadRemoteSessionPage).mockReturnValueOnce(pending.promise);
+    const opening = useChatStore.getState().selectSession(remote.engine, remote.sessionId, WS);
+    await vi.waitFor(() => expect(useChatStore.getState().bySession[key].messages).toEqual(page.messages));
+    const runId = "cache-refresh-completed-turn";
+    vi.mocked(ipc.sendMessage).mockResolvedValueOnce({ runId, sessionId: remote.sessionId });
+    await useChatStore.getState().send("A new message", []);
+    handleEngineEvents([
+      { engine: remote.engine, sessionId: remote.sessionId, runId, seq: 1, kind: "delta", data: "A new answer" },
+      { engine: remote.engine, sessionId: remote.sessionId, runId, seq: 2, kind: "done", data: {} },
+    ], engineDeps());
+    const live = useChatStore.getState().bySession[key];
+    expect(live.streaming).toBe(false);
+    expect(live.settledRunIds).toContain(runId);
+    expect(live.messages.some((message) => message.text === "A new message")).toBe(true);
+    expect(live.messages.some((message) => message.text === "A new answer")).toBe(true);
+    pending.resolve(page);
+    await opening;
+    expect(useChatStore.getState().bySession[key].messages).toBe(live.messages);
+    expect(useChatStore.getState().bySession[key].historyCache?.updated).toBe(true);
+  });
+
+  it("loads from the remote source when no readable local snapshot is available", async () => {
+    vi.mocked(ipc.loadCachedRemoteSessionPage).mockRejectedValueOnce(new Error("Cache missing"));
+    vi.mocked(ipc.loadRemoteSessionPage).mockResolvedValueOnce(page);
+    await useChatStore.getState().selectSession(remote.engine, remote.sessionId, WS);
+    expect(useChatStore.getState().bySession[key]).toMatchObject({ messages: page.messages, loading: false, historyCache: { updated: true }, error: null });
+  });
+
+  const workspace = { id: "ssh", name: "remote", path: WS, lastOpenedAt: null, sortOrder: null, groupId: null, meta: { ssh: {
+    host: "vps", user: "cc", port: 22, identityFile: "/private/key", workspace: WS, enginePaths: { claude: "/usr/bin/claude" },
+  } } } satisfies Workspace;
+
+  it("restores the offline catalog and cached active tab before the remote listing completes", async () => {
+    cacheSshSessionMetas([workspace], workspace, [remote]);
+    const tab = { engine: remote.engine, sessionId: remote.sessionId, workspacePath: WS };
+    persistTabs([tab], tab);
+    useChatStore.setState({ initialized: false, sessions: [], workspaces: [] });
+    vi.mocked(ipc.listWorkspaces).mockResolvedValueOnce([workspace]);
+    vi.mocked(ipc.listEngines).mockResolvedValueOnce([{ id: "claude", available: false, enabled: true }] as any);
+    const listing = Promise.withResolvers<SessionMeta[]>();
+    const refresh = Promise.withResolvers<SessionPage>();
+    vi.mocked(ipc.listSshSessions).mockClear().mockReturnValueOnce(listing.promise);
+    vi.mocked(ipc.loadRemoteSessionPage).mockReturnValueOnce(refresh.promise);
+    vi.mocked(ipc.loadCachedRemoteSessionPage).mockResolvedValueOnce({ page, cachedAt: 1000 });
+    const events = vi.spyOn(window, "addEventListener");
+    await useChatStore.getState().init();
+    await Promise.resolve();
+    expect(useChatStore.getState().sessions[0]).toMatchObject({ sessionId: remote.sessionId, remote: true, remotePath: remote.remotePath });
+    expect(useChatStore.getState().active).toEqual(tab);
+    expect(useChatStore.getState().bySession[key].messages).toEqual(page.messages);
+    expect(ipc.listSshSessions).toHaveBeenCalledWith(WS);
+    const catalogRefresh = useChatStore.getState().refreshSessions();
+    expect(ipc.listSshSessions).toHaveBeenCalledExactlyOnceWith(WS);
+    listing.reject(new Error("Offline"));
+    refresh.reject(new Error("Offline"));
+    await catalogRefresh;
+    await vi.waitFor(() => expect(useChatStore.getState().bySession[key].historyCache?.refreshError).toBe("Offline"));
+    for (const [type, listener] of events.mock.calls) if (type === CLI_CONFIG_CHANGED_EVENT) window.removeEventListener(type, listener);
+    events.mockRestore();
+  });
+
+  it.each(["archive", "delete"])("prunes the persisted catalog after a successful %s", async (action) => {
+    useChatStore.setState({ workspaces: [workspace] });
+    cacheSshSessionMetas([workspace], workspace, [remote]);
+    if (action === "archive") await useChatStore.getState().archiveSession(remote);
+    else await useChatStore.getState().deleteSession(remote.engine, remote.sessionId);
+    expect(cachedSshSessionMetas([workspace])).toEqual([]);
+  });
+});
 
 describe("per-session composer selection", () => {
   beforeEach(resetStore);
@@ -856,6 +1056,73 @@ describe("refreshSessions and the not-yet-scanned session", () => {
     expect(useChatStore.getState().openTabs).toEqual([]);
     expect(useChatStore.getState().active).toBeNull();
     expect(useChatStore.getState().bySession["omp/s-archived"]).toBeUndefined();
+  });
+});
+
+describe("overlapping SSH catalog refreshes", () => {
+  const workspace = { id: "ssh", name: "remote", path: WS, lastOpenedAt: null, sortOrder: null, groupId: null, meta: { ssh: {
+    host: "vps", user: "cc", port: 22, identityFile: "/private/key", workspace: WS, enginePaths: { claude: "/usr/bin/claude" },
+  } } } satisfies Workspace;
+  const remote = { engine: "claude", sessionId: "catalog", workspacePath: WS, remote: true, remotePath: "/home/cc/catalog.jsonl",
+    filePath: "/home/cc/catalog.jsonl", fileSize: 1, fileMtimeMs: 1, title: "Latest catalog", preview: "", createdAt: 1,
+    updatedAt: 2, messageCount: 1, pinned: false, customTitle: null } satisfies SessionMeta;
+
+  beforeEach(() => {
+    resetStore();
+    useChatStore.setState({ workspaces: [workspace], actionError: null });
+    vi.mocked(ipc.listSessions).mockReset().mockResolvedValue([]);
+    vi.mocked(ipc.listSshSessions).mockReset().mockResolvedValue([remote]);
+  });
+
+  it("shares one SSH read across simultaneous session refreshes", async () => {
+    const pending = Promise.withResolvers<SessionMeta[]>();
+    vi.mocked(ipc.listSshSessions).mockReturnValueOnce(pending.promise);
+    const first = useChatStore.getState().refreshSessions();
+    const second = useChatStore.getState().refreshSessions();
+    expect(ipc.listSshSessions).toHaveBeenCalledExactlyOnceWith(WS);
+    pending.resolve([remote]);
+    await Promise.all([first, second]);
+    expect(useChatStore.getState().sessions).toEqual([remote]);
+  });
+
+  it("clears only the SSH banner it owns after a successful catalog read", async () => {
+    vi.mocked(ipc.listSshSessions).mockRejectedValueOnce(new Error("Connection closed"));
+    await useChatStore.getState().refreshSessions();
+    expect(useChatStore.getState().actionError).toContain("Connection closed");
+    await useChatStore.getState().refreshSessions();
+    expect(useChatStore.getState().actionError).toBeNull();
+
+    vi.mocked(ipc.listSshSessions).mockRejectedValueOnce(new Error("Connection closed"));
+    await useChatStore.getState().refreshSessions();
+    const pending = Promise.withResolvers<SessionMeta[]>();
+    vi.mocked(ipc.listSshSessions).mockReturnValueOnce(pending.promise);
+    const refreshing = useChatStore.getState().refreshSessions();
+    useChatStore.setState({ actionError: "Git push failed" });
+    pending.resolve([remote]);
+    await refreshing;
+    expect(useChatStore.getState().actionError).toBe("Git push failed");
+  });
+
+  it("does not replace an unrelated error with a catalog failure", async () => {
+    useChatStore.setState({ actionError: "Archive failed" });
+    vi.mocked(ipc.listSshSessions).mockRejectedValueOnce(new Error("Connection closed"));
+    await useChatStore.getState().refreshSessions();
+    expect(useChatStore.getState().actionError).toBe("Archive failed");
+  });
+
+  it("ignores an older failed batch that finishes after a newer successful scan", async () => {
+    const local = Promise.withResolvers<SessionMeta[]>();
+    const failed = Promise.reject<SessionMeta[]>(new Error("Old connection failure"));
+    vi.mocked(ipc.listSessions).mockReturnValueOnce(local.promise);
+    vi.mocked(ipc.listSshSessions).mockReturnValueOnce(failed);
+    const older = useChatStore.getState().refreshSessions();
+    await failed.catch(() => {});
+    await useChatStore.getState().refreshSessions();
+    expect(useChatStore.getState().sessions).toEqual([remote]);
+    local.resolve([]);
+    await older;
+    expect(useChatStore.getState().sessions).toEqual([remote]);
+    expect(useChatStore.getState().actionError).toBeNull();
   });
 });
 

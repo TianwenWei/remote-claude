@@ -52,6 +52,7 @@ export function AiChatSidebar({
   onThreadAction,
   onCopyThreadId,
   onAddWorkspace,
+  onNewRemoteProject,
   onRemoveWorkspace,
   onWorkspaceAlias,
   onSetWorkspaceArchived,
@@ -79,6 +80,7 @@ export function AiChatSidebar({
   /** Thread context-menu action: copy the session id to the clipboard. */
   onCopyThreadId?: (id: string) => void;
   onAddWorkspace?: () => void;
+  onNewRemoteProject?: () => void;
   onRemoveWorkspace?: (id: string) => void;
   /** Workspace context-menu action: open the set-alias dialog for the row. */
   onWorkspaceAlias?: (id: string) => void;
@@ -189,6 +191,7 @@ export function AiChatSidebar({
             onThreadAction={onThreadAction}
             onThreadContextMenu={openThreadMenu}
             onAddWorkspace={onAddWorkspace}
+            onNewRemoteProject={onNewRemoteProject}
             onRemoveWorkspace={onRemoveWorkspace}
             onNewSessionInWorkspace={onNewSessionInWorkspace}
             onNewWorktree={onNewWorktree}

@@ -1,4 +1,4 @@
-import type { SessionMeta, SessionPage } from "@/lib/ipc";
+import type { CachedRemoteSessionPage, SessionMeta, SessionPage } from "@/lib/ipc";
 import type { ChatStore } from "./types";
 
 /**
@@ -27,6 +27,11 @@ export type LoadHistoryPage = (
   beforeSeq?: number | null,
   meta?: SessionMeta,
 ) => Promise<SessionPage>;
+
+export type LoadCachedHistoryPage = (
+  engine: string, sessionId: string, workspacePath: string,
+  limit?: number, beforeSeq?: number | null,
+) => Promise<CachedRemoteSessionPage | null>;
 
 /** useChatStore.subscribe, injected so compactContext needs no store import. */
 export type StoreSubscribe = (listener: () => void) => () => void;

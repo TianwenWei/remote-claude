@@ -30,7 +30,7 @@ describe("context window memory", () => {
 
   it("treats a broken storage as a cache miss instead of crashing", () => {
     const setItem = vi
-      .spyOn(Storage.prototype, "setItem")
+      .spyOn(localStorage, "setItem")
       .mockImplementation(() => {
         throw new Error("quota exceeded");
       });
@@ -53,6 +53,14 @@ describe("context window memory", () => {
         model: "default",
       }),
     ).toBe(1_000_000);
+  });
+
+  it("uses live window metadata before token usage is known", () => {
+    rememberContextWindow("claude", "default", 200_000);
+    expect(resolveContextMax({
+      usage: { model_context_window: 1_000_000 },
+      engine: "claude", model: "default", catalogWindow: 200_000,
+    })).toBe(1_000_000);
   });
 
   it("prefers a live report, then memory, then the catalog, then the guess", () => {

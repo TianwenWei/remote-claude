@@ -1114,7 +1114,9 @@ function onUsage(
   deps: EngineEventDeps,
 ) {
   const parsed = parseUsage(event.data);
-  const totals = parsed ? addTurnUsage(event.runId, parsed) : null;
+  const contextOnly = Boolean(event.data && typeof event.data === "object" &&
+    (event.data as { context_only?: unknown }).context_only === true);
+  const totals = parsed && !contextOnly ? addTurnUsage(event.runId, parsed) : null;
   // A compaction report carries only the new occupancy, so the window is
   // taken from the last snapshot that had one: the gauge must not drop to
   // the assumed 200k just because this report is narrower (see mergeUsage).
@@ -1123,7 +1125,14 @@ function onUsage(
     usage: mergeUsage(event.data, prev),
     ...(totals ? { turnUsage: usageSnapshot(totals) } : {}),
   });
-  if (parsed) recordUsageReport(deps, event, key, parsed);
+  if (parsed && !contextOnly) recordUsageReport(deps, event, key, parsed);
+}
+
+/** Done carries billing totals outside its optional occupancy snapshot. */
+function turnBillingUsage(usage: unknown): unknown {
+  if (!usage || typeof usage !== "object") return usage;
+  const { last_token_usage: _contextSnapshot, ...aggregate } = usage as Record<string, unknown>;
+  return aggregate;
 }
 
 /** Fold one report into its run's running total. */
@@ -1196,6 +1205,20 @@ function writeUsageRow(
     .catch(() => {});
 }
 
+/** Native cancellation normally settles requests first; terminal events
+ * also expire any outstanding approval so a lost settle event cannot leave
+ * an actionable permission card for a dead process. */
+function expireToolPermissions(messages: Message[], runId: string): Message[] {
+  let changed = false;
+  const expired = messages.map((message) => {
+    const question = message.question;
+    if (!question?.toolPermission || question.runId !== runId || question.status !== "pending") return message;
+    changed = true;
+    return { ...message, question: { ...question, status: "cancelled" as const } };
+  });
+  return changed ? expired : messages;
+}
+
 function onError(
   event: ChatEngineEvent,
   key: string,
@@ -1231,6 +1254,7 @@ function onError(
           )
         : cur.messages,
     );
+    messages = expireToolPermissions(messages, event.runId);
     const durationMs = cur.turnStartedAt
       ? Math.max(0, Date.now() - cur.turnStartedAt)
       : null;
@@ -1532,6 +1556,24 @@ function onQuestion(
   }
 }
 
+/** Only a native tool_permission event can open this approval surface.
+ * Ordinary AskUserQuestion payloads cannot set its typed metadata. */
+function onToolPermission(event: ChatEngineEvent, key: string, deps: EngineEventDeps) {
+  const data = event.data as { requestId?: unknown; toolUseId?: unknown; toolName?: unknown; inputJson?: unknown } | null;
+  if (!data || typeof data.requestId !== "string" || !data.requestId.trim() ||
+      typeof data.toolName !== "string" || !data.toolName.trim() || typeof data.inputJson !== "string") return;
+  const requestId = data.requestId;
+  const toolName = data.toolName;
+  const inputJson = data.inputJson;
+  updatePlanMessages(deps, key, event, (messages) => {
+    if (messages.some((message) => message.role === "question" && message.question?.requestId === requestId)) return null;
+    const seq = messages.length ? messages[messages.length - 1].seq + 1 : 1;
+    return [...messages, { role: "question", text: toolName, ts: new Date().toISOString(), seq,
+      question: { requestId, runId: event.runId, toolUseId: typeof data.toolUseId === "string" ? data.toolUseId : null,
+        questions: [], status: "pending", toolPermission: { toolName, inputJson } } }];
+  });
+}
+
 /** Fold unflushed stream chunks into settled rows, then run a plan-card
  *  transform, so a plan card lands after the text streamed before it (the
  *  same fold the question/grant cards do). */
@@ -1725,10 +1767,16 @@ function onDone(event: ChatEngineEvent, key: string, deps: EngineEventDeps) {
       stampedEffort(deps, event.engine, key),
     );
   }
-  // Occupancy for the context meter: the newest single report (claude's one
-  // payload already carries the turn's totals).
+  // The result's aggregate bills the whole turn. Occupancy comes from its
+  // explicit last-request snapshot or the most recent live/history report.
   const turnTotals = turnUsageTotals.get(event.runId);
-  let settledUsage = mergeUsage(turnTotals ? prev.usage : data.usage, prev.usage);
+  const doneUsage = data.usage && typeof data.usage === "object"
+    ? data.usage as Record<string, unknown> : null;
+  const nestedContext = doneUsage?.last_token_usage;
+  const contextUsage = turnTotals && parseUsage(prev.usage) ? prev.usage
+    : parseUsage(nestedContext) ? data.usage
+    : parseUsage(prev.usage) ? prev.usage : data.usage;
+  let settledUsage = mergeUsage(contextUsage, prev.usage);
   const finalWindow = reportedContextWindow(data.usage);
   if (finalWindow && settledUsage && typeof settledUsage === "object") {
     settledUsage = { ...settledUsage, model_context_window: finalWindow };
@@ -1738,7 +1786,7 @@ function onDone(event: ChatEngineEvent, key: string, deps: EngineEventDeps) {
   turnUsageTotals.delete(event.runId);
   const finalUsage = turnTotals
     ? mergeUsage(usageSnapshot(turnTotals), settledUsage)
-    : settledUsage;
+    : turnBillingUsage(data.usage);
   // Fold the turn's last unflushed chunks (the final sink batch can arrive
   // in the same frame as done), then settle every live row: the streamed
   // text the user watched arrive *is* the final message.
@@ -1753,7 +1801,7 @@ function onDone(event: ChatEngineEvent, key: string, deps: EngineEventDeps) {
           pending.effort ?? stampedEffort(deps, event.engine, key),
         )
       : cur.messages;
-    messages = settleLiveRows(messages);
+    messages = expireToolPermissions(settleLiveRows(messages), event.runId);
     const turnStart = cur.turnStartedAt ?? prev.turnStartedAt;
     const durationMs = turnStart ? Math.max(0, Date.now() - turnStart) : null;
     const model = stampedModel(deps, event.engine, key);
@@ -1843,7 +1891,7 @@ function recordTurnUsage(
 ) {
   if (!usageTrackingEnabled()) return;
   if (liveLedgerRuns.delete(event.runId)) return;
-  const parsed = parseUsage(usage);
+  const parsed = parseUsage(turnBillingUsage(usage));
   if (!parsed) return;
   writeUsageRow(deps, event, key, parsed, 1);
 }
@@ -2061,6 +2109,9 @@ export function handleEngineEvents(
         break;
       case "question":
         onQuestion(event, key, deps);
+        break;
+      case "tool_permission":
+        onToolPermission(event, key, deps);
         break;
       case "question_settled":
         onQuestionSettled(event, key, deps);

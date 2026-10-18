@@ -3,7 +3,9 @@
 //!
 //!   cargo run --example ops_smoke
 
-use ccgui_next_lib::git;
+use ccgui_next_lib::{db::Db, git};
+use std::sync::Arc;
+use tauri::Manager;
 
 fn main() {
     // git_status/push/pull are async (spawn_blocking under the hood), so the
@@ -21,6 +23,13 @@ async fn git_smoke() {
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
     let path = dir.to_string_lossy().to_string();
+    let db_dir =
+        std::env::temp_dir().join(format!("ccgui-git-smoke-state-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&db_dir).unwrap();
+    let app = tauri::test::mock_builder()
+        .manage(Arc::new(Db::open_at(&db_dir.join("app.db")).unwrap()))
+        .build(tauri::test::mock_context(tauri::test::noop_assets()))
+        .unwrap();
 
     // init repo with one commit
     let repo = git2::Repository::init(&dir).unwrap();
@@ -46,7 +55,7 @@ async fn git_smoke() {
     std::fs::write(dir.join("b.txt"), "new file\n").unwrap();
     std::fs::write(dir.join("a.txt"), "hello\nworld\n").unwrap();
 
-    let status = git::git_status(path.clone()).await.unwrap();
+    let status = git::git_status(app.state(), path.clone()).await.unwrap();
     println!(
         "status: branch={} staged={} unstaged={} untracked={}",
         status.branch,
@@ -57,14 +66,14 @@ async fn git_smoke() {
     assert_eq!(status.unstaged.len(), 1);
     assert_eq!(status.untracked.len(), 1);
 
-    let diff = git::git_diff(path.clone(), "a.txt".into(), false)
+    let diff = git::git_diff(app.state(), path.clone(), "a.txt".into(), false)
         .await
         .unwrap();
     assert!(diff.contains("+world"), "diff shows added line: {diff}");
     println!("diff: ok ({} bytes)", diff.len());
     // Untracked files must produce a real patch for preview (regression:
     // worktree diffs used to return empty for them).
-    let diff = git::git_diff(path.clone(), "b.txt".into(), false)
+    let diff = git::git_diff(app.state(), path.clone(), "b.txt".into(), false)
         .await
         .unwrap();
     assert!(
@@ -73,13 +82,21 @@ async fn git_smoke() {
     );
     println!("untracked diff: ok ({} bytes)", diff.len());
 
-    git::git_stage(path.clone(), vec!["a.txt".into(), "b.txt".into()]).unwrap();
-    let status = git::git_status(path.clone()).await.unwrap();
+    git::git_stage(
+        app.state(),
+        path.clone(),
+        vec!["a.txt".into(), "b.txt".into()],
+    )
+    .await
+    .unwrap();
+    let status = git::git_status(app.state(), path.clone()).await.unwrap();
     assert_eq!(status.staged.len(), 2, "two staged after stage: {status:?}");
     println!("stage: ok");
 
-    git::git_unstage(path.clone(), vec!["b.txt".into()]).unwrap();
-    let status = git::git_status(path.clone()).await.unwrap();
+    git::git_unstage(app.state(), path.clone(), vec!["b.txt".into()])
+        .await
+        .unwrap();
+    let status = git::git_status(app.state(), path.clone()).await.unwrap();
     assert_eq!(status.staged.len(), 1);
     assert_eq!(
         status.untracked.len(),
@@ -88,30 +105,43 @@ async fn git_smoke() {
     );
     println!("unstage: ok");
 
-    let oid = git::git_commit(path.clone(), "second commit".into()).unwrap();
+    let oid = git::git_commit(app.state(), path.clone(), "second commit".into())
+        .await
+        .unwrap();
     println!("commit: ok ({oid})");
-    let status = git::git_status(path.clone()).await.unwrap();
+    let status = git::git_status(app.state(), path.clone()).await.unwrap();
     assert_eq!(status.staged.len(), 0);
 
-    git::git_create_branch(path.clone(), "feature-x".into()).unwrap();
-    let status = git::git_status(path.clone()).await.unwrap();
+    git::git_create_branch(app.state(), path.clone(), "feature-x".into())
+        .await
+        .unwrap();
+    let status = git::git_status(app.state(), path.clone()).await.unwrap();
     assert_eq!(status.branch, "feature-x");
     println!("create_branch+checkout: ok");
 
-    git::git_checkout(path.clone(), "master".into())
-        .or_else(|_| git::git_checkout(path.clone(), "main".into()))
-        .unwrap();
-    let branches = git::git_branches(path.clone()).unwrap();
+    if git::git_checkout(app.state(), path.clone(), "master".into())
+        .await
+        .is_err()
+    {
+        git::git_checkout(app.state(), path.clone(), "main".into())
+            .await
+            .unwrap();
+    }
+    let branches = git::git_branches(app.state(), path.clone()).await.unwrap();
     assert!(branches.iter().any(|b| b.name == "feature-x"));
     println!(
         "branches: {:?}",
         branches.iter().map(|b| &b.name).collect::<Vec<_>>()
     );
 
-    let not_repo = git::git_status("/tmp".into()).await.unwrap_err();
+    let not_repo = git::git_status(app.state(), "/tmp".into())
+        .await
+        .unwrap_err();
     assert_eq!(not_repo, "NOT_A_REPO");
     println!("not-a-repo error: ok");
 
+    drop(app);
     let _ = std::fs::remove_dir_all(&dir);
+    let _ = std::fs::remove_dir_all(&db_dir);
     println!("GIT SMOKE PASSED");
 }

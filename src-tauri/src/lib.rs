@@ -5,6 +5,7 @@ pub mod bots;
 pub mod baidu_tongji;
 pub mod browser;
 pub mod cc_switch;
+pub mod claude_account_usage;
 pub mod cli_lifecycle;
 pub mod clipboard;
 pub mod computer_use;
@@ -99,6 +100,7 @@ pub fn run() {
     // Restore workspace .omp/mcp.json files left injected by a crash
     // (computer use writes them per send and restores on run exit).
     computer_use::sweep_mcp_injections();
+    #[cfg(not(feature = "remote-vps"))]
     config::import_legacy_config_once();
     // A .app launched from Finder/Launchpad gets the launchd PATH
     // (/usr/bin:/bin:…), so `which::which` can't see CLIs installed via
@@ -137,18 +139,21 @@ pub fn run() {
             let db = Arc::new(db::Db::open().expect("failed to open app db"));
             // Sweep per-send credential staging left behind by a crash.
             engine::sweep_staging_dirs();
+            #[cfg(not(feature = "remote-vps"))]
             if let Err(error) = db::import_legacy_workspaces_once(&db) {
                 // Import failure must never block startup; the sidebar simply
                 // starts empty and the user adds workspaces by hand.
                 eprintln!("[db] legacy workspace import failed: {error}");
             }
 
+            #[cfg(not(feature = "remote-vps"))]
             if let Err(error) = settings::import_legacy_groups_once(&db) {
                 // Same non-fatal rule: groups stay unassigned and the user can
                 // redo them in Settings → 工作区.
                 eprintln!("[settings] legacy group import failed: {error}");
             }
 
+            #[cfg(not(feature = "remote-vps"))]
             if let Err(error) = bots::import_legacy_app_agents_once(&db) {
                 // Same non-fatal rule: the `#` picker simply starts empty.
                 eprintln!("[bots] legacy agent import failed: {error}");
@@ -160,6 +165,7 @@ pub fn run() {
                 Ok(count) => eprintln!("[bots] migrated {count} agent(s) to bots"),
                 Err(error) => eprintln!("[bots] agent→bot migration failed: {error}"),
             }
+            #[cfg(not(feature = "remote-vps"))]
             if let Err(error) = prompts::import_legacy_prompts_once(&db) {
                 // Same non-fatal rule: the `!` picker simply starts empty.
                 eprintln!("[prompts] legacy prompt import failed: {error}");
@@ -299,7 +305,7 @@ pub fn run() {
                 "main",
                 tauri::WebviewUrl::App("index.html".into()),
             )
-            .title("CC GUI")
+            .title(if cfg!(feature = "remote-vps") { "Remote Claude" } else { "CC GUI" })
             .inner_size(1400.0, 900.0)
             .min_inner_size(900.0, 600.0);
             #[cfg(target_os = "macos")]
@@ -479,8 +485,10 @@ pub fn run() {
             usage::usage_record,
             usage::usage_summary,
             usage::usage_clear,
+            claude_account_usage::claude_account_usage,
             history::reader::load_session_page,
             history::reader::load_remote_session_page,
+            history::reader::load_cached_remote_session_page,
             history::search::search_messages,
             history::reader::delete_session,
             history::reader::delete_remote_session,
@@ -492,6 +500,12 @@ pub fn run() {
             history::reader::rescan_sessions,
             history::reader::list_workspaces,
             history::reader::add_workspace,
+            engine::remote_workspace::probe_ssh_connection,
+            engine::ssh_onboarding::inspect_ssh_host_key,
+            engine::ssh_onboarding::trust_ssh_host_key,
+            engine::remote_workspace::add_ssh_workspace,
+            engine::remote_workspace::create_ssh_workspace,
+            engine::remote_workspace::list_ssh_sessions,
             history::reader::reorder_workspaces,
             history::reader::remove_workspace,
             history::reader::set_workspace_group,

@@ -16,6 +16,7 @@ import { ROW } from "./CliChannelRow";
 import { GrantedRootsCard } from "./GrantedRootsCard";
 import { GroupNameEditor, GroupRow } from "./WorkspaceGroupRow";
 import { WorkspaceProjectsCard } from "./WorkspaceProjectsCard";
+import { SshWorkspacesCard } from "./SshWorkspacesCard";
 
 /**
  * 工作区二级分类 settings: group CRUD (create / rename / drag-reorder /
@@ -110,6 +111,13 @@ export function WorkspacesSection() {
 
   return (
     <div className="flex w-full flex-col gap-6">
+      <SshWorkspacesCard workspaces={workspaces} onRegistered={async (workspace) => {
+        useChatStore.setState((state) => ({
+          workspaces: [...state.workspaces.filter((item) => item.id !== workspace.id), workspace],
+        }));
+        await useChatStore.getState().refreshWorkspaces();
+        await useChatStore.getState().refreshSessions();
+      }} />
       {error && (
         <p role="alert" className="text-body-regular text-text-error-primary">
           {t("common.error")}: {error}

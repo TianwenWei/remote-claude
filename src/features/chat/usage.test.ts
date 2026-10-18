@@ -76,6 +76,25 @@ describe("parseUsage", () => {
 });
 
 describe("mergeUsage", () => {
+  it.each([{}, { input_tokens: 0, output_tokens: 0 }])("keeps known occupancy when the next report is a placeholder: %j", (placeholder) => {
+    const previous = { input_tokens: 90_000, output_tokens: 1_000, model_context_window: 1_000_000 };
+    expect(mergeUsage(placeholder, previous)).toBe(previous);
+  });
+
+  it("updates window-only metadata without discarding known tokens", () => {
+    const previous = { input_tokens: 90_000, output_tokens: 1_000, model_context_window: 200_000 };
+    expect(parseUsage(mergeUsage({ model_context_window: 1_000_000 }, previous))).toMatchObject({
+      input: 90_000, output: 1_000, total: 91_000, contextWindow: 1_000_000,
+    });
+  });
+
+  it("accepts a smaller valid occupancy after compaction", () => {
+    const previous = { input_tokens: 90_000, model_context_window: 1_000_000 };
+    expect(parseUsage(mergeUsage({ input_tokens: 8_000 }, previous))).toMatchObject({
+      input: 8_000, total: 8_000, contextWindow: 1_000_000,
+    });
+  });
+
   it("keeps a previously reported context window", () => {
     const merged = mergeUsage(
       { input_tokens: 10, output_tokens: 2, total_tokens: 12 },

@@ -1,0 +1,42 @@
+{
+  "productName": "Remote Claude",
+  "identifier": "local.ccgui.remote-vps",
+  "app": {
+    "security": {
+      "assetProtocol": {
+        "enable": true,
+        "scope": {
+          "allow": [
+            "$HOME/**"
+          ],
+          "deny": [
+            "$HOME/.ssh/**",
+            "$HOME/.aws/**",
+            "$HOME/.gnupg/**",
+            "$HOME/.ccgui-next/**",
+            "$HOME/.ccgui-remote-vps/**"
+          ]
+        }
+      }
+    }
+  },
+  "bundle": {
+    "createUpdaterArtifacts": false,
+    "macOS": {
+      "signingIdentity": "-"
+    },
+    "icon": [
+      "icons/remote-claude/32x32.png",
+      "icons/remote-claude/128x128.png",
+      "icons/remote-claude/128x128@2x.png",
+      "icons/remote-claude/icon.icns",
+      "icons/remote-claude/icon.ico",
+      "icons/remote-claude/icon.png"
+    ]
+  },
+  "plugins": {
+    "updater": {
+      "endpoints": []
+    }
+  }
+}

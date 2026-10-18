@@ -26,7 +26,7 @@ vi.mock("@/features/plugins/runtime/loader", () => ({
   unloadPlugin: vi.fn(),
 }));
 vi.mock("@/features/plugins/builtin", () => ({ BUILTIN_PLUGINS: [] }));
-vi.mock("@/features/open-app/HeaderOpenActions", () => ({ HeaderOpenActions: () => null }));
+vi.mock("@/features/open-app/HeaderOpenActions", () => ({ HeaderOpenActions: () => <button aria-label="终端" /> }));
 vi.mock("@/features/launch-script/LaunchScriptActions", () => ({ LaunchScriptActions: () => null }));
 vi.mock("@/features/files/FilesPanel", () => ({ FilesPanel: () => null }));
 vi.mock("@/features/git/ChangesPanel", () => ({ ChangesPanel: () => null }));
@@ -35,6 +35,8 @@ import "@/lib/i18n";
 import { panelTabRegistry } from "@ccgui/plugin-sdk";
 import { usePluginsStore } from "@/features/plugins/manager/usePlugins";
 import { ChatPanelHeader } from "./ChatPanelHeader";
+import { sessionKey, useChatStore } from "./store";
+import { EMPTY_SESSION } from "./store/stream";
 // Side-effect import: registers the builtin files/changes tabs.
 import "./panel-tabs";
 
@@ -73,16 +75,18 @@ function installedPlugin(overrides: Partial<PluginInfo> & { id: string }): Plugi
   };
 }
 
-describe("ChatPanelHeader plugin pills", () => {
+describe("ChatPanelHeader", () => {
   let container: HTMLDivElement;
   let root: Root;
   let disposers: Array<() => void>;
   const onPanelTabChange = vi.fn();
+  const selectSession = useChatStore.getState().selectSession;
 
-  function header(panelTab = "files"): ReactNode {
+  function header(panelTab = "files", activeTabKey: string | null = null): ReactNode {
     return (
       <ChatPanelHeader
         workspacePath="/tmp/ws"
+        activeTabKey={activeTabKey}
         panelTab={panelTab}
         onPanelTabChange={onPanelTabChange}
         panelCollapsed={false}
@@ -98,6 +102,7 @@ describe("ChatPanelHeader plugin pills", () => {
     pluginReadArtwork.mockClear();
     onPanelTabChange.mockClear();
     usePluginsStore.setState({ installed: [] });
+    useChatStore.setState({ active: null, workspaces: [], bySession: {}, selectSession });
     disposers = [];
     container = document.createElement("div");
     document.body.appendChild(container);
@@ -110,6 +115,7 @@ describe("ChatPanelHeader plugin pills", () => {
       root.unmount();
     });
     container.remove();
+    useChatStore.setState({ selectSession });
   });
 
   /** Render and flush the artwork read's promise chain. */
@@ -130,6 +136,30 @@ describe("ChatPanelHeader plugin pills", () => {
       ) ?? null
     );
   }
+
+  it("places remote history refresh beside Terminal and targets the active conversation", async () => {
+    const active = { engine: "claude", sessionId: "remote-session", workspacePath: "/tmp/ws" };
+    const key = sessionKey(active.engine, active.sessionId, active.workspacePath);
+    const refresh = vi.fn().mockResolvedValue(undefined);
+    useChatStore.setState({
+      active,
+      selectSession: refresh,
+      workspaces: [{ id: "remote", name: "ws", path: "/tmp/ws", lastOpenedAt: null, sortOrder: 0, groupId: null,
+        meta: { ssh: { host: "example.com", user: "cc", port: 22, identityFile: null, workspace: "/tmp/ws", enginePaths: { claude: "/usr/bin/claude" } } } }],
+      bySession: { [key]: { ...EMPTY_SESSION, historyCache: { cachedAt: 1000, refreshing: false, refreshError: null } } },
+    });
+    await render(header("files", key));
+    const buttons = [...container.querySelectorAll("button")];
+    expect(buttons[buttons.findIndex((button) => button.ariaLabel === "终端") + 1]?.ariaLabel).toBe("更新远程记录");
+    await act(async () => pill("更新远程记录")!.click());
+    expect(refresh).toHaveBeenCalledWith("claude", "remote-session", "/tmp/ws");
+    // A file/other conversation tab must not refresh the hidden chat.
+    await render(header("files", "file:/tmp/ws/readme.md"));
+    expect(pill("更新远程记录")).toBeNull();
+    await act(async () => useChatStore.setState({ workspaces: [] }));
+    await render(header("files", key));
+    expect(pill("更新远程记录")).toBeNull();
+  });
 
   it("keeps icon + label for builtin tabs", () => {
     act(() => {

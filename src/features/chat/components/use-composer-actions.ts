@@ -4,6 +4,7 @@ import { useShallow } from "zustand/react/shallow";
 import type { ComposerInputHandle } from "@/components/application/ai-chat/ai-chat-composer";
 import { mentionToken } from "@/components/application/ai-chat/file-tags";
 import { pickFiles } from "@/lib/platform";
+import { sshWorkspaceMetaOf } from "@/lib/ssh-workspace";
 import { useChatStore, sessionKey as toSessionKey, type ActiveSession } from "../store";
 import { parseAppCommand } from "@/components/application/ai-chat/app-commands";
 import {
@@ -70,6 +71,10 @@ export function useComposerActions({
           ? parseAppCommand(value, active.workspacePath)
           : null;
       if (appCommand?.command === "cua") {
+        if (sshWorkspaceMetaOf(useChatStore.getState().workspaces?.find((workspace) => workspace.path === active.workspacePath))) {
+          setSessionError(sessionKey, t("chat.cuaRemoteUnsupported"));
+          return;
+        }
         // Bare form opens the setup door: permission status and the grant
         // flow live in Settings → 电脑操控.
         if (!appCommand.arg) {

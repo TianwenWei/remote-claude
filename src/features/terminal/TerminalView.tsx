@@ -4,6 +4,8 @@ import type { FitAddon } from "@xterm/addon-fit";
 import { useTranslation } from "react-i18next";
 import { isMacPlatform } from "@/features/shortcuts/shortcuts";
 import { ipc } from "@/lib/ipc";
+import { useChatStore } from "@/features/chat/store";
+import { isSshWorkspacePath } from "@/lib/ssh-workspace";
 import { loadXterm, type XtermModules } from "./xterm-loader";
 import { terminalFontFamily, terminalTheme } from "./appearance";
 import { FONT_CHANGE_EVENT } from "@/features/settings/font";
@@ -133,17 +135,20 @@ export const TerminalView = memo(function TerminalView({ id, cwd }: { id: string
       safeFit();
       void openSession();
 
-      // Absolute paths in output become modifier-click-to-reveal links
-      // (see links.ts).
-      linkDisposable = term.registerLinkProvider(
-        createPathLinkProvider({
-          term,
-          cwd,
-          onActivate: (path) => {
-            void ipc.revealInFileManager(path).catch(() => {});
-          },
-        }),
-      );
+      // Finder reveal is local-only. Registering its provider for SSH would
+      // still run remote directory probes on hover for an unavailable action.
+      if (!isSshWorkspacePath(useChatStore.getState().workspaces, cwd)) {
+        linkDisposable = term.registerLinkProvider(
+          createPathLinkProvider({
+            term,
+            cwd,
+            onActivate: (path) => {
+              if (isSshWorkspacePath(useChatStore.getState().workspaces, cwd)) return;
+              void ipc.revealInFileManager(path).catch(() => {});
+            },
+          }),
+        );
+      }
 
       inputDisposable = term.onData((data) => {
         const write = () =>

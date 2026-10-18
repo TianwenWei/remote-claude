@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
-import { filterEngineOptions, orderEngineOptions } from "./engine-options";
-import type { EngineInfo } from "@/lib/ipc";
+import { filterEngineOptions, orderEngineOptions, sshWorkspaceAllowedEngines } from "./engine-options";
+import type { EngineInfo, Workspace } from "@/lib/ipc";
 
 function engine(id: string, over: Partial<EngineInfo> = {}): EngineInfo {
   return { id, enabled: true, available: true, ...over } as EngineInfo;
@@ -37,6 +37,19 @@ describe("filterEngineOptions", () => {
     expect(out.map((o) => o.id)).toEqual(["omp"]);
     expect(out[0]?.available).toBe(true);
     expect(out[0]?.disabled).toBe(false);
+  });
+
+  it("uses the SSH host's Claude discovery when this Mac has no Claude CLI", () => {
+    const workspace = { meta: { ssh: { host: "vps", user: "cc", port: 22, identityFile: null,
+      workspace: "/home/cc/project", enginePaths: { claude: "/home/cc/.local/bin/claude" } } } } as unknown as Workspace;
+    const allowed = sshWorkspaceAllowedEngines(workspace);
+    expect(allowed).toEqual(["claude"]);
+    expect(filterEngineOptions([engine("codex"), engine("claude", { available: false })], allowed, t))
+      .toMatchObject([{ id: "claude", available: true, disabled: false }]);
+    workspace.meta!.ssh = { ...(workspace.meta!.ssh as object), enginePaths: {} };
+    expect(sshWorkspaceAllowedEngines(workspace)).toEqual([]);
+    expect(filterEngineOptions([engine("codex")], sshWorkspaceAllowedEngines(workspace), t)).toEqual([]);
+    expect(sshWorkspaceAllowedEngines(undefined)).toBeNull();
   });
 });
 

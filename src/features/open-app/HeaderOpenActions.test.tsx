@@ -22,7 +22,7 @@ vi.mock("@/lib/platform", () => ({
   pickFile: vi.fn().mockResolvedValue(null),
 }));
 
-import "@/lib/i18n";
+import i18n from "@/lib/i18n";
 import { onLaunchScriptEditorRequest } from "@/features/launch-script/launch-script";
 import { HeaderOpenActions } from "./HeaderOpenActions";
 import {
@@ -81,6 +81,15 @@ describe("HeaderOpenActions add-program", () => {
     });
     container.remove();
     document.body.querySelectorAll("[data-react-aria-top-layer]").forEach((node) => node.remove());
+  });
+
+  it("keeps the SSH terminal reachable while hiding local editors and Finder", async () => {
+    await act(async () => { root.render(<HeaderOpenActions workspacePath="/home/cc/project" remote />); });
+    const buttons = container.querySelectorAll("button");
+    expect(buttons).toHaveLength(1);
+    expect(buttons[0].getAttribute("aria-label")).toBe(i18n.t("openApp.terminal"));
+    expect(mocks.openWorkspaceIn).not.toHaveBeenCalled();
+    expect(mocks.revealInFileManager).not.toHaveBeenCalled();
   });
 
   async function openMenu() {

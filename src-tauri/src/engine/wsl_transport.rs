@@ -1,22 +1,12 @@
-//! WSL 远程 spawn 通道 —— 把本机构造的引擎命令包装成 `ssh → wsl.exe` 执行。
+//! SSH engine transport for native Linux (`meta.ssh`) and the existing
+//! Windows/WSL plugin (`meta.wsl`). Both upload a private command script and
+//! keep prompt/control stdin and NDJSON stdout attached to the native run.
 //!
-//! 工作区行带 `meta.wsl`(插件 `workspaces.add` 写入,见 plugin-sdk 0.3.3)时,
-//! `send_message` 经此模块把引擎进程放到远程 Windows 宿主的发行版内:
-//!
-//! 1. 生成发行版内脚本:先 `cd` 到发行版内工作区,再以**发行版内**的引擎
-//!    路径 `exec <cli> <args…>`(argv[0] 经 `enginePaths` 表或远端
-//!    `command -v` 解析 —— 本机 macOS/Windows 路径在 Linux 里不存在);
-//! 2. 一次 `ssh <host> "wsl.exe -d <distro> -- tee /tmp/ccgui-wsl-<id>.sh"`
-//!    经 stdin 明文写入脚本(脚本内容不进命令串,零转义需求);
-//! 3. 真正的 run 进程 = `ssh <host> "wsl.exe -d <distro> -- bash /tmp/….sh"`
-//!    (命令串只含固定词,无 `$`/`|`/`>`/反引号,cmd/PowerShell 均惰性),
-//!    脚本以 `exec` 开头(bash 被替换为 CLI):stdin(prompt payload)与
-//!    stdout(NDJSON 流)原样直通本管道,进程组 kill → ssh 断 → 远端
-//!    SIGHUP 直达 CLI,中断语义与本地一致。
-//!
-//! 认证:key 直连(BatchMode),或插件预先建立的 SSH ControlMaster
-//! (`controlPath` 随 meta 传入,本地 ssh 复用既有主连接,免密码交互)。
-//! 远端脚本落盘 harmless(只含命令行,prompt 走 stdin 不落盘)。
+//! Native Linux uses the remote login shell, strict known-host validation,
+//! and an optional explicit identity file. A remote supervisor owns a fresh
+//! CLI process group and watches its sshd parent, terminating the CLI and
+//! tool children after disconnect. WSL retains its existing wsl.exe path.
+//! Prompts travel over stdin and are never embedded in uploaded scripts.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -43,15 +33,36 @@ pub struct WslTransport {
     pub distro: String,
     /// SSH ControlMaster 套接字路径;None = 纯 BatchMode(key 认证)。
     pub control_path: Option<String>,
+    /// Native Linux SSH key. Empty distro selects Linux rather than WSL.
+    pub identity_file: Option<String>,
     /// 引擎 bin 在发行版内的绝对路径(bin 名 → 路径,插件探针写入)。
     pub engine_paths: HashMap<String, String>,
     /// 工作区在发行版内的路径(`cd` 目标;缺省 = 发行版默认 cwd)。
     pub workspace: Option<String>,
 }
 
-/// 从工作区 `meta` JSON 提取传输描述;形状不符 = None(按本地工作区跑)。
+/// Compatibility parser. Actions use the checked parser/path lookup below
+/// so invalid remote metadata cannot silently select local execution.
 pub fn from_workspace_meta(meta: &serde_json::Value) -> Option<WslTransport> {
-    let wsl = meta.get("wsl")?;
+    from_workspace_meta_checked(meta).ok().flatten()
+}
+
+/// A registered remote workspace must never silently turn into a local one.
+pub fn from_workspace_meta_checked(
+    meta: &serde_json::Value,
+) -> Result<Option<WslTransport>, String> {
+    if !meta.is_object() || (meta.get("ssh").is_some() && meta.get("wsl").is_some()) {
+        return Err("Invalid or ambiguous remote workspace metadata".into());
+    }
+    let Some(remote) = meta.get("ssh").or_else(|| meta.get("wsl")) else {
+        return Ok(None);
+    };
+    parse_remote_meta(remote, meta.get("ssh").is_some())
+        .map(Some)
+        .ok_or_else(|| "Invalid remote workspace metadata; reconnect this workspace".to_string())
+}
+
+fn parse_remote_meta(wsl: &serde_json::Value, linux: bool) -> Option<WslTransport> {
     let host = wsl.get("host")?.as_str()?.trim().to_string();
     if !is_safe_host(&host) {
         return None;
@@ -60,8 +71,36 @@ pub fn from_workspace_meta(meta: &serde_json::Value) -> Option<WslTransport> {
     if !is_safe_user(&user) {
         return None;
     }
-    let distro = wsl.get("distro")?.as_str()?.trim().to_string();
-    if !is_safe_distro(&distro) {
+    let distro = if linux {
+        String::new()
+    } else {
+        wsl.get("distro")?.as_str()?.trim().to_string()
+    };
+    if !linux && !is_safe_distro(&distro) {
+        return None;
+    }
+    let workspace = wsl
+        .get("workspace")
+        .and_then(|v| v.as_str())
+        .map(str::to_string);
+    if linux && !workspace.as_deref().is_some_and(is_safe_linux_path) {
+        return None;
+    }
+    let identity_file = match wsl.get("identityFile") {
+        None | Some(serde_json::Value::Null) => None,
+        Some(value) => {
+            let path = value.as_str()?;
+            if !std::path::Path::new(path).is_absolute() || path.contains(['\0', '\n', '\r']) {
+                return None;
+            }
+            Some(path.to_string())
+        }
+    };
+    let port = match wsl.get("port") {
+        Some(v) => v.as_u64()?.try_into().ok()?,
+        None => 22,
+    };
+    if port == 0 {
         return None;
     }
     let engine_paths = wsl
@@ -78,17 +117,18 @@ pub fn from_workspace_meta(meta: &serde_json::Value) -> Option<WslTransport> {
         .unwrap_or_default();
     Some(WslTransport {
         host,
-        port: match wsl.get("port") {
-            Some(v) => v.as_u64()?.try_into().ok()?,
-            None => 22,
-        },
+        port,
         user,
         distro,
-        control_path: wsl
-            .get("controlPath")
-            .and_then(|v| v.as_str())
-            .map(str::to_string)
-            .filter(|s| !s.trim().is_empty()),
+        control_path: if linux {
+            None
+        } else {
+            wsl.get("controlPath")
+                .and_then(|v| v.as_str())
+                .map(str::to_string)
+                .filter(|s| !s.trim().is_empty())
+        },
+        identity_file,
         engine_paths,
         workspace: wsl
             .get("workspace")
@@ -98,13 +138,18 @@ pub fn from_workspace_meta(meta: &serde_json::Value) -> Option<WslTransport> {
     })
 }
 
-/// meta.wsl 字段字符白名单 —— 这些值来自插件/IPC 写入的 db 行,之后会拼进
-/// 本机 ssh argv 与远端 Windows 命令串,解析入口统一收口,违例整体按 None
-/// (本地工作区)处理,fail-closed。
+pub fn is_safe_linux_path(path: &str) -> bool {
+    path.starts_with('/')
+        && !path.contains(['\0', '\n', '\r'])
+        && !path.split('/').any(|part| part == "..")
+}
+
+/// Remote host/user fields are checked before they reach SSH argv or the
+/// Windows-side WSL shell. Checked callers surface invalid registration.
 
 /// ssh 登录名:Linux 用户名字符集,且不得以 `-` 开头 —— 否则 `user@host`
 /// 整体会被 ssh 的 getopt 当成选项吞掉(`-oProxyCommand=…` → 本机命令执行)。
-fn is_safe_user(user: &str) -> bool {
+pub(super) fn is_safe_user(user: &str) -> bool {
     !user.is_empty()
         && !user.starts_with('-')
         && user
@@ -113,7 +158,7 @@ fn is_safe_user(user: &str) -> bool {
 }
 
 /// 主机地址:IP/主机名/IPv6,同样不得以 `-` 开头(getopt 选项注入)。
-fn is_safe_host(host: &str) -> bool {
+pub(super) fn is_safe_host(host: &str) -> bool {
     !host.is_empty()
         && !host.starts_with('-')
         && host
@@ -173,16 +218,43 @@ fn program_args_env(command: &Command) -> (String, Vec<String>, Vec<(String, Str
 fn ssh_options(transport: &WslTransport) -> Vec<String> {
     let mut opts = vec![
         "-o".to_string(),
-        // 首连信任(TOFU):已知主机之后的改动仍会拦,但首次连接不验指纹 ——
-        // LAN 上首连可被 MITM 而无感知。可用性权衡:首次接入提示交给插件
-        // 连接流程;若后续要硬约束,可让 meta 携带已知主机指纹。
-        "StrictHostKeyChecking=accept-new".to_string(),
+        // Keep the existing WSL plugin's first-connect policy. Native Linux
+        // requires an already trusted known_hosts entry on every connection.
+        if transport.distro.is_empty() {
+            "StrictHostKeyChecking=yes"
+        } else {
+            "StrictHostKeyChecking=accept-new"
+        }
+        .to_string(),
         "-o".to_string(),
         "ConnectTimeout=10".to_string(),
         "-p".to_string(),
         transport.port.to_string(),
     ];
-    match &transport.control_path {
+    if transport.distro.is_empty() {
+        // File/Git helpers send sizeable scripts over stdin. Compression
+        // reduces bulk traffic through local VPN/TUN network adapters.
+        opts.extend(["-o".to_string(), "Compression=yes".to_string()]);
+    }
+    if let Some(identity) = &transport.identity_file {
+        opts.extend([
+            "-i".to_string(),
+            identity.clone(),
+            "-o".to_string(),
+            "IdentitiesOnly=yes".to_string(),
+        ]);
+    }
+    opts.extend([
+        "-o".to_string(),
+        "ServerAliveInterval=15".to_string(),
+        "-o".to_string(),
+        "ServerAliveCountMax=3".to_string(),
+    ]);
+    match transport
+        .control_path
+        .as_ref()
+        .filter(|_| !transport.distro.is_empty())
+    {
         // Master connection exists → no password prompt will occur; BatchMode
         // keeps a dead master from hanging the spawn waiting on input.
         Some(cp) => {
@@ -205,17 +277,68 @@ fn ssh_target(transport: &WslTransport) -> String {
 
 /// 公共 ssh 命令骨架:选项 + `--` + destination。`--` 终结 getopt 解析,
 /// destination 永远不被当成选项(user/host 另有白名单,这里是纵深防御)。
-fn base_ssh_command(transport: &WslTransport) -> Command {
+pub(crate) fn base_ssh_command(transport: &WslTransport) -> Command {
+    ssh_command_with_control(transport, None)
+}
+
+/// Only explicitly read-only RPCs reuse a master. OpenSSH keeps the first
+/// supplied option, so these options replace the dedicated mode at construction.
+fn readonly_ssh_command(transport: &WslTransport) -> Result<Command, String> {
+    let control = if transport.distro.is_empty() {
+        super::ssh_rpc_mux::control_path(
+            &transport.host,
+            &transport.user,
+            transport.port,
+            transport.identity_file.as_deref(),
+        )?
+    } else {
+        None
+    };
+    Ok(ssh_command_with_control(transport, control.as_deref()))
+}
+
+fn ssh_command_with_control(
+    transport: &WslTransport,
+    control: Option<&std::path::Path>,
+) -> Command {
     let mut command = Command::new("ssh");
     for opt in ssh_options(transport) {
         command.arg(opt);
+    }
+    if transport.distro.is_empty() {
+        if let Some(path) = control {
+            command.args(["-o", "ControlMaster=auto", "-o", "ControlPersist=60", "-o"]);
+            command.arg(format!("ControlPath={}", path.display()));
+            command.args([
+                "-o",
+                "ForwardAgent=no",
+                "-o",
+                "ForwardX11=no",
+                "-o",
+                "ClearAllForwardings=yes",
+                "-o",
+                "RequestTTY=no",
+            ]);
+        } else {
+            // Cancellation watches this session's sshd parent. A user's
+            // ControlMaster would outlive a closed multiplex channel.
+            command.args(["-o", "ControlMaster=no", "-o", "ControlPath=none"]);
+        }
     }
     command.arg("--");
     command.arg(ssh_target(transport));
     command
 }
 
-fn wsl_command_string(transport: &WslTransport, remote_argv: &[&str]) -> String {
+pub(crate) fn remote_command_string(transport: &WslTransport, remote_argv: &[&str]) -> String {
+    if transport.distro.is_empty() {
+        let inner = remote_argv
+            .iter()
+            .map(|arg| sh_quote(arg))
+            .collect::<Vec<_>>()
+            .join(" ");
+        return format!("bash -lc {}", sh_quote(&format!("exec {inner}")));
+    }
     let distro = transport.distro.replace('"', "");
     let joined = remote_argv
         .iter()
@@ -229,6 +352,11 @@ fn wsl_command_string(transport: &WslTransport, remote_argv: &[&str]) -> String 
         .collect::<Vec<_>>()
         .join(" ");
     format!("wsl.exe -d \"{distro}\" -- {joined}")
+}
+
+#[cfg(test)]
+fn wsl_command_string(transport: &WslTransport, remote_argv: &[&str]) -> String {
+    remote_command_string(transport, remote_argv)
 }
 
 /// 把本机 argv[0] 解析成发行版内的可执行路径:
@@ -270,21 +398,33 @@ fn build_script(
         script.push_str(&format!("export {key}={}\n", sh_quote(value)));
     }
     if let Some(ws) = &transport.workspace {
-        if !is_safe_workspace(ws) {
+        if transport.distro.is_empty() {
+            if !is_safe_linux_path(ws) {
+                return "echo 'Invalid remote workspace' >&2; exit 60\n".into();
+            }
+            script.push_str(&format!("cd -- {} || exit 61\n", sh_quote(ws)));
+        } else if !is_safe_workspace(ws) {
             return format!("echo 'workspace 路径含不支持的字符' >&2; exit 60\n");
+        } else {
+            script.push_str(&format!("cd {ws} || exit 61\n"));
         }
-        script.push_str(&format!("cd {ws} || exit 61\n"));
     }
     let resolved = resolve_remote_program(program, transport);
+    let invocation_start;
     if let Some(base) = resolved.strip_prefix("__RESOLVE__") {
         // 登录 shell 解析(~/.profile 后的 PATH):非登录 `command -v`
         // 探不到 ~/.local/bin(tmd 2026-09-12 实测),引擎常装在那。
         script.push_str(&format!(
             "bin=$(bash -lc {}) || exit 62\n",
-            sh_quote(&format!("command -v {base}"))
+            sh_quote(&format!("command -v {}", sh_quote(base)))
         ));
+        if transport.distro.is_empty() {
+            script.push_str("export bin\n");
+        }
+        invocation_start = script.len();
         script.push_str("exec \"$bin\"");
     } else {
+        invocation_start = script.len();
         script.push_str("exec ");
         script.push_str(&sh_quote(&resolved));
     }
@@ -293,6 +433,17 @@ fn build_script(
         script.push_str(&sh_quote(a));
     }
     script.push('\n');
+    if transport.distro.is_empty() {
+        // A non-PTY SSH disconnect need not HUP the CLI. Keep a supervisor
+        // attached to sshd and terminate the isolated CLI process group if
+        // that parent disappears. Explicit stdin redirection preserves the
+        // stream-json permission/answer channel for the background child.
+        let invocation = script.split_off(invocation_start);
+        script.push_str(&format!(
+            "parent=$PPID\nsetsid bash -c {} <&0 &\nworker=$!\n(while kill -0 \"$parent\" 2>/dev/null; do sleep 1; done; kill -TERM -- -\"$worker\" 2>/dev/null; sleep 2; kill -KILL -- -\"$worker\" 2>/dev/null) < /dev/null > /dev/null 2>&1 &\nwatcher=$!\ncleanup() {{ kill \"$watcher\" 2>/dev/null || true; kill -TERM -- -\"$worker\" 2>/dev/null || true; for n in 1 2 3 4 5 6 7 8 9 10; do kill -0 -- -\"$worker\" 2>/dev/null || return 0; sleep 0.2; done; kill -KILL -- -\"$worker\" 2>/dev/null || true; }}\ntrap cleanup EXIT HUP TERM INT\nset +e\nwait \"$worker\"\nstatus=$?\nexit \"$status\"\n",
+            sh_quote(&invocation)
+        ));
+    }
     script
 }
 
@@ -303,44 +454,124 @@ async fn upload_script(
     script_body: &str,
     remote_path: &str,
 ) -> Result<(), String> {
+    // Uploads are short SSH connections too. Release the shared budget before
+    // spawning the dedicated interactive CLI connection in `wrap`.
+    let _permit = if transport.distro.is_empty() {
+        Some(super::ssh_rpc_pool::acquire(&transport.host, transport.port, false).await?)
+    } else {
+        None
+    };
     let mut command = base_ssh_command(transport);
-    command.arg(wsl_command_string(transport, &["tee", remote_path]));
-    // stderr 直接丢弃:从不读取却 piped 会在远端写满管缓冲时与 wait 互等
-    // 死锁;错误细节本就不进报错文案(下面是固定提示)。
+    if transport.distro.is_empty() {
+        command.arg(format!("umask 077; cat > {}", sh_quote(remote_path)));
+    } else {
+        command.arg(remote_command_string(transport, &["tee", remote_path]));
+    }
+    upload_child(command, script_body, REMOTE_CALL_TIMEOUT).await
+}
+
+/// Keep writes and diagnostic reads concurrent: SSH can fill stderr before
+/// reading stdin, otherwise both pipes can block each other. All three phases
+/// share one deadline, and diagnostics already received survive a timeout.
+async fn upload_child(
+    mut command: Command,
+    script_body: &str,
+    deadline: Duration,
+) -> Result<(), String> {
     command
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
-        .stderr(Stdio::null());
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
     let mut child = command
         .spawn()
         .map_err(|e| format!("ssh 脚本上传失败: {e}"))?;
-    let wrote = if let Some(mut stdin) = child.stdin.take() {
+    let mut stdin = child
+        .stdin
+        .take()
+        .ok_or("SSH upload stdin was unavailable")?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or("SSH upload stderr was unavailable")?;
+    let mut diagnostics = Vec::new();
+    let mut write_finished = false;
+    let mut ssh_exited = false;
+    let completed = &mut write_finished;
+    let writing = async move {
         use tokio::io::AsyncWriteExt;
         let result = stdin.write_all(script_body.as_bytes()).await;
-        stdin.shutdown().await.ok();
+        let _ = stdin.shutdown().await;
+        // `shutdown` alone need not close a pipe. Own and drop the writer
+        // here so the remote cat/tee receives EOF before we await SSH exit.
         drop(stdin);
+        *completed = true;
         result
-    } else {
-        Ok(())
     };
-    wrote.map_err(|e| format!("ssh 脚本写入失败: {e}"))?;
-    // 全局 deadline:远端挂起时管道写满会让 wait 与 write 互等,没有超时
-    // 这个 future 永不 resolve(调用链上UI 无取消路径)。超时即 kill,
-    // 不留半写的远端脚本与孤儿 ssh。
-    let status = match tokio::time::timeout(REMOTE_CALL_TIMEOUT, child.wait()).await {
-        Ok(result) => result.map_err(|e| format!("ssh 脚本上传等待失败: {e}"))?,
+    let result = tokio::time::timeout(deadline, async {
+        tokio::join!(
+            writing,
+            drain_upload_stderr(stderr, &mut diagnostics),
+            async {
+                let result = child.wait().await;
+                ssh_exited = true;
+                result
+            }
+        )
+    })
+    .await;
+    let (wrote, drained, waited) = match result {
+        Ok(results) => results,
         Err(_) => {
             let _ = child.start_kill();
+            let phase = if !write_finished {
+                "writing SSH stdin"
+            } else if !ssh_exited {
+                "waiting for SSH exit"
+            } else {
+                "waiting for SSH stderr EOF"
+            };
+            let detail = String::from_utf8_lossy(&diagnostics);
+            let detail = detail.trim();
             return Err(format!(
-                "wsl 脚本上传超时({}s,检查远程主机 wsl.exe 是否无响应)",
-                REMOTE_CALL_TIMEOUT.as_secs()
+                "SSH script upload timed out ({}s; {phase}){}",
+                deadline.as_secs(),
+                if detail.is_empty() {
+                    String::new()
+                } else {
+                    format!(": {detail}")
+                }
             ));
         }
     };
+    let status = waited.map_err(|e| format!("ssh 脚本上传等待失败: {e}"))?;
     if !status.success() {
-        return Err("wsl 脚本上传失败(检查远程主机连接/认证;ControlMaster 可能已过期,请在 WSL 主机设置重新连接)".to_string());
+        return Err(format!(
+            "SSH script upload failed (exit {:?}): {}",
+            status.code(),
+            String::from_utf8_lossy(&diagnostics).trim()
+        ));
     }
+    wrote.map_err(|e| format!("ssh 脚本写入失败: {e}"))?;
+    drained.map_err(|e| format!("SSH upload diagnostic read failed: {e}"))?;
     Ok(())
+}
+
+async fn drain_upload_stderr(
+    mut stderr: tokio::process::ChildStderr,
+    retained: &mut Vec<u8>,
+) -> std::io::Result<()> {
+    use tokio::io::AsyncReadExt;
+    const DIAGNOSTIC_LIMIT: usize = 16 * 1024;
+    let mut buffer = [0; 8192];
+    loop {
+        let count = stderr.read(&mut buffer).await?;
+        if count == 0 {
+            return Ok(());
+        }
+        let keep = count.min(DIAGNOSTIC_LIMIT.saturating_sub(retained.len()));
+        retained.extend_from_slice(&buffer[..keep]);
+    }
 }
 
 /// 包装结果:重造后的 ssh 命令 + 本地临时标记文件(run 结束清理)。
@@ -364,7 +595,7 @@ pub async fn wrap(command: Command, transport: &WslTransport) -> Result<Wrapped,
 
     let mut wrapped = base_ssh_command(transport);
     // 脚本已明文落盘,run 串只含固定词。
-    wrapped.arg(wsl_command_string(transport, &["bash", &remote_path]));
+    wrapped.arg(remote_command_string(transport, &["bash", &remote_path]));
     Ok(Wrapped {
         command: wrapped,
         cleanup_files: vec![local_tmp],
@@ -396,21 +627,68 @@ pub fn fallback_cwd() -> &'static std::path::Path {
     std::path::Path::new(".")
 }
 
-/// 远程跑一段脚本并取 stdout(模型列表等短命令;上传 + 运行两步,
-/// 复用 send 路径同一套 ssh/wsl 串 —— ControlMaster/key 认证同源)。
-/// 返回值已剥传输层噪声(NUL 残迹与 wsl.exe 诊断行;wsl 通道特有,
-/// 载荷本体不受影响),调用方无需重复处理。
+/// Run a bounded RPC with a dedicated Linux SSH connection, including writes.
+/// Guaranteed read-only callers use `run_readonly_script_output` to reuse a
+/// private connection. WSL retains its uploaded-script transport and noise
+/// filtering under both APIs.
 pub async fn run_script_output(
     transport: &WslTransport,
     script_body: &str,
 ) -> Result<String, String> {
+    run_script_output_with_timeout(transport, script_body, REMOTE_CALL_TIMEOUT).await
+}
+
+/// Explicitly read-only calls may reuse a private, briefly persisted SSH
+/// connection. Channel cancellation cannot promise to stop a remote mutation.
+pub async fn run_readonly_script_output(
+    transport: &WslTransport,
+    script_body: &str,
+) -> Result<String, String> {
+    run_readonly_script_output_with_timeout(transport, script_body, REMOTE_CALL_TIMEOUT).await
+}
+
+/// Bulk transcript transfers have a separate deadline from small RPCs.
+pub async fn run_script_output_with_timeout(
+    transport: &WslTransport,
+    script_body: &str,
+    deadline: Duration,
+) -> Result<String, String> {
+    run_script_output_impl(transport, script_body, deadline, false).await
+}
+
+pub async fn run_readonly_script_output_with_timeout(
+    transport: &WslTransport,
+    script_body: &str,
+    deadline: Duration,
+) -> Result<String, String> {
+    run_script_output_impl(transport, script_body, deadline, true).await
+}
+
+async fn run_script_output_impl(
+    transport: &WslTransport,
+    script_body: &str,
+    deadline: Duration,
+    readonly: bool,
+) -> Result<String, String> {
+    if transport.distro.is_empty() {
+        // Serialize connection bursts across workspaces and blocking runtimes.
+        // A bulk transfer reserves its own slot before competing for the
+        // general pool, so queued downloads cannot occupy all short-RPC slots.
+        let _permit = super::ssh_rpc_pool::acquire(
+            &transport.host,
+            transport.port,
+            deadline > REMOTE_CALL_TIMEOUT,
+        )
+        .await?;
+        return run_linux_script_output(transport, script_body, deadline, readonly).await;
+    }
     let script_id = uuid::Uuid::new_v4().simple().to_string();
     let remote_path = format!("/tmp/ccgui-wsl-{script_id}.sh");
     // 调用方脚本同样落盘即删(bash 从已打开 fd 继续读,unlink 不影响执行)。
     let body = format!("rm -f \"$0\"\n{script_body}");
     upload_script(transport, &body, &remote_path).await?;
     let mut command = base_ssh_command(transport);
-    command.arg(wsl_command_string(transport, &["bash", &remote_path]));
+    command.arg(remote_command_string(transport, &["bash", &remote_path]));
     command
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -419,12 +697,12 @@ pub async fn run_script_output(
     // 这里,远端挂起不得拖死前端。kill_on_drop:超时后 output future 被
     // 丢弃即 SIGKILL 本地 ssh(远端脚本落盘即删,无残留面)。
     command.kill_on_drop(true);
-    let output = match tokio::time::timeout(REMOTE_CALL_TIMEOUT, command.output()).await {
+    let output = match tokio::time::timeout(deadline, command.output()).await {
         Ok(result) => result.map_err(|e| format!("远程命令执行失败: {e}"))?,
         Err(_) => {
             return Err(format!(
                 "远程命令超时({}s,检查远程主机 wsl.exe 是否无响应)",
-                REMOTE_CALL_TIMEOUT.as_secs()
+                deadline.as_secs()
             ));
         }
     };
@@ -435,7 +713,126 @@ pub async fn run_script_output(
             String::from_utf8_lossy(&output.stderr).trim()
         ));
     }
-    Ok(String::from_utf8_lossy(&strip_transport_noise(output.stdout.as_slice())).to_string())
+    if transport.distro.is_empty() {
+        Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+    } else {
+        Ok(String::from_utf8_lossy(&strip_transport_noise(output.stdout.as_slice())).to_string())
+    }
+}
+
+/// Short Linux RPCs own stdin, so stream their script directly to one SSH
+/// session. Engine runs still upload first to reserve stdin for chat/control.
+async fn run_linux_script_output(
+    transport: &WslTransport,
+    script: &str,
+    deadline: Duration,
+    readonly: bool,
+) -> Result<String, String> {
+    let mut command = if readonly {
+        readonly_ssh_command(transport)?
+    } else {
+        base_ssh_command(transport)
+    };
+    command.arg(remote_command_string(transport, &["bash", "-ls"]));
+    run_linux_script_command(command, script, deadline).await
+}
+
+/// First-connect diagnostics must also work when Bash/Python are missing.
+/// This fixed POSIX bootstrap prefers the same Bash login environment as
+/// engine runs, but can report missing dependencies through a plain sh.
+pub(super) async fn run_readonly_probe_output(
+    transport: &WslTransport,
+    script: &str,
+) -> Result<String, String> {
+    if !transport.distro.is_empty() {
+        return Err("SSH dependency diagnostics require a Linux workspace".into());
+    }
+    let _permit = super::ssh_rpc_pool::acquire(&transport.host, transport.port, false).await?;
+    let mut command = readonly_ssh_command(transport)?;
+    command.arg(
+        "sh -lc 'if command -v bash >/dev/null 2>&1; then exec bash -ls; else exec sh -ls; fi'",
+    );
+    run_linux_script_command(command, script, REMOTE_CALL_TIMEOUT).await
+}
+
+async fn run_linux_script_command(
+    mut command: Command,
+    script: &str,
+    deadline: Duration,
+) -> Result<String, String> {
+    use tokio::io::AsyncWriteExt;
+    command
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+    let mut child = command
+        .spawn()
+        .map_err(|e| format!("SSH command failed to start: {e}"))?;
+    let mut stdin = child.stdin.take().ok_or("SSH stdin was unavailable")?;
+    let result = tokio::time::timeout(deadline, async {
+        tokio::join!(
+            async move {
+                stdin.write_all(script.as_bytes()).await?;
+                let result = stdin.shutdown().await;
+                drop(stdin);
+                result
+            },
+            child.wait_with_output()
+        )
+    })
+    .await
+    .map_err(|_| format!("Remote command timed out ({}s)", deadline.as_secs()))?;
+    let (write_result, output) = result;
+    let output = output.map_err(|e| format!("SSH command failed: {e}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "Remote command exited {:?}: {}",
+            output.status.code(),
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    write_result.map_err(|e| format!("SSH script write failed: {e}"))?;
+    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
+/// Synchronous file/Git IPC handlers can use the same bounded transport.
+/// A dedicated runtime thread also works when called from a Tokio worker.
+pub fn run_script_output_blocking(
+    transport: &WslTransport,
+    script_body: &str,
+) -> Result<String, String> {
+    run_script_output_blocking_impl(transport, script_body, false)
+}
+
+pub fn run_readonly_script_output_blocking(
+    transport: &WslTransport,
+    script_body: &str,
+) -> Result<String, String> {
+    run_script_output_blocking_impl(transport, script_body, true)
+}
+
+fn run_script_output_blocking_impl(
+    transport: &WslTransport,
+    script_body: &str,
+    readonly: bool,
+) -> Result<String, String> {
+    let transport = transport.clone();
+    let body = script_body.to_string();
+    std::thread::spawn(move || {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|e| e.to_string())?
+            .block_on(run_script_output_impl(
+                &transport,
+                &body,
+                REMOTE_CALL_TIMEOUT,
+                readonly,
+            ))
+    })
+    .join()
+    .map_err(|_| "Remote command worker failed".to_string())?
 }
 
 /// wsl.exe 传输层噪声:NUL 残迹(UTF-16LE lossy 后)与 `wsl:`/`wsl.` 开头
@@ -456,7 +853,41 @@ fn strip_transport_noise(raw: &[u8]) -> Vec<u8> {
 /// 工作区路径 → 传输描述一步到位(db 读 + meta 形状解析都收敛在此,
 /// 调用方不再自行组合两步查找)。
 pub fn transport_for_workspace(db: &crate::db::Db, workspace_path: &str) -> Option<WslTransport> {
-    transport_from_meta_json(workspace_meta_json(db, workspace_path).as_deref())
+    transport_for_path(db, workspace_path).ok().flatten()
+}
+
+/// Longest registered ancestor wins. Invalid matching metadata is an error,
+/// so a corrupt remote row can never grant access to a similarly named Mac path.
+pub fn transport_for_path(db: &crate::db::Db, path: &str) -> Result<Option<WslTransport>, String> {
+    if path.contains('\0') || path.split('/').any(|part| part == "..") {
+        return Err("Invalid workspace path".into());
+    }
+    let conn = db.0.lock();
+    let mut stmt = conn
+        .prepare("SELECT path, meta FROM workspaces ORDER BY length(path) DESC")
+        .map_err(|e| e.to_string())?;
+    let rows = stmt
+        .query_map([], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?))
+        })
+        .map_err(|e| e.to_string())?;
+    for row in rows {
+        let (root, meta) = row.map_err(|e| e.to_string())?;
+        let root = root.trim_end_matches('/');
+        if path == root
+            || path
+                .strip_prefix(root)
+                .is_some_and(|tail| tail.starts_with('/'))
+        {
+            let Some(raw) = meta else {
+                return Ok(None);
+            };
+            let value = serde_json::from_str(&raw)
+                .map_err(|e| format!("Invalid workspace metadata: {e}"))?;
+            return from_workspace_meta_checked(&value);
+        }
+    }
+    Ok(None)
 }
 
 #[cfg(test)]
@@ -471,6 +902,7 @@ mod tests {
             user: "dev".into(),
             distro: "Ubuntu-22.04".into(),
             control_path: None,
+            identity_file: None,
             engine_paths: HashMap::from([(
                 "omp".to_string(),
                 "/home/dev/.local/bin/omp".to_string(),
@@ -539,7 +971,8 @@ mod tests {
     #[test]
     fn script_falls_back_to_command_v() {
         let script = build_script("kimi", &[], &[], &tp());
-        assert!(script.contains("bin=$(bash -lc 'command -v kimi') || exit 62"));
+        assert!(script.contains("command -v"));
+        assert!(script.contains("exit 62"));
         assert!(script.contains("exec \"$bin\""));
     }
 
@@ -623,5 +1056,461 @@ mod tests {
         assert!(args[..dashdash]
             .iter()
             .all(|a| a.starts_with('-') || !a.contains('@')));
+    }
+
+    #[test]
+    fn readonly_mux_is_explicit_and_dedicated_connections_never_inherit_it() {
+        let mut transport = tp();
+        transport.distro.clear();
+        // A Linux row cannot inject an alternative control socket ahead of
+        // the dedicated/read-only mode (OpenSSH's first value wins).
+        transport.control_path = Some("/tmp/untrusted-control".into());
+        let args = |command: Command| {
+            command
+                .as_std()
+                .get_args()
+                .map(|arg| arg.to_string_lossy().into_owned())
+                .collect::<Vec<_>>()
+        };
+        let dedicated = args(base_ssh_command(&transport));
+        assert!(dedicated.contains(&"ControlMaster=no".into()));
+        assert!(dedicated.contains(&"ControlPath=none".into()));
+        assert!(!dedicated
+            .iter()
+            .any(|arg| arg.starts_with("ControlPersist=")));
+        let readonly = args(ssh_command_with_control(
+            &transport,
+            Some(std::path::Path::new("/private/tmp/private.sock")),
+        ));
+        assert!(readonly.contains(&"ControlMaster=auto".into()));
+        assert!(readonly.contains(&"ControlPersist=60".into()));
+        assert!(readonly.contains(&"ControlPath=/private/tmp/private.sock".into()));
+        let separator = readonly.iter().position(|arg| arg == "--").unwrap();
+        assert_eq!(readonly[separator + 1], "dev@10.0.0.2");
+        for option in [
+            "ControlMaster=auto",
+            "ControlPersist=60",
+            "ControlPath=/private/tmp/private.sock",
+        ] {
+            assert!(readonly[..separator].contains(&option.into()));
+        }
+        for option in ["ControlMaster=", "ControlPath="] {
+            assert_eq!(
+                readonly
+                    .iter()
+                    .filter(|arg| arg.starts_with(option))
+                    .count(),
+                1
+            );
+            assert_eq!(
+                dedicated
+                    .iter()
+                    .filter(|arg| arg.starts_with(option))
+                    .count(),
+                1
+            );
+        }
+        for option in [
+            "ForwardAgent=no",
+            "ForwardX11=no",
+            "ClearAllForwardings=yes",
+            "RequestTTY=no",
+        ] {
+            assert!(readonly[..separator].contains(&option.into()));
+        }
+        assert!(!readonly.iter().any(|arg| arg.contains("untrusted-control")));
+        let wsl = args(ssh_command_with_control(
+            &tp(),
+            Some(std::path::Path::new("/tmp/ignored")),
+        ));
+        assert!(!wsl
+            .iter()
+            .any(|arg| arg.starts_with("ControlMaster=") || arg.starts_with("ControlPersist=")));
+    }
+
+    #[test]
+    fn linux_metadata_uses_key_and_strict_known_hosts() {
+        let value = json!({"ssh": {"host":"vps.example","user":"dev","port":2222,
+            "identityFile":"/Users/dev/.ssh/vps","workspace":"/srv/project with spaces",
+            "enginePaths":{"claude":"/home/dev/.local/bin/claude"}}});
+        let transport = from_workspace_meta_checked(&value).unwrap().unwrap();
+        assert!(transport.distro.is_empty());
+        let opts = ssh_options(&transport);
+        assert!(opts.contains(&"StrictHostKeyChecking=yes".into()));
+        assert!(!opts.contains(&"StrictHostKeyChecking=accept-new".into()));
+        assert!(opts.contains(&"/Users/dev/.ssh/vps".into()));
+        assert!(opts.contains(&"IdentitiesOnly=yes".into()));
+        let script = build_script(
+            "claude",
+            &["--model".into(), "x'; touch /tmp/evil".into()],
+            &[],
+            &transport,
+        );
+        assert!(script.contains("cd -- '/srv/project with spaces'"));
+        assert!(script.contains("setsid bash -c"));
+        assert!(script.contains("<&0 &"));
+        assert!(script.contains("parent=$PPID"));
+        assert!(!script.contains("wsl.exe"));
+    }
+
+    #[test]
+    fn linux_ssh_compresses_bulk_scripts_without_overriding_qos_or_wsl() {
+        let mut transport = tp();
+        assert!(!ssh_options(&transport)
+            .iter()
+            .any(|arg| arg.starts_with("Compression=")));
+        transport.distro.clear();
+        let opts = ssh_options(&transport);
+        assert!(opts
+            .windows(2)
+            .any(|pair| pair == ["-o", "Compression=yes"]));
+        assert!(!opts.iter().any(|arg| arg.starts_with("IPQoS=")));
+    }
+
+    #[test]
+    fn malformed_remote_metadata_is_an_error() {
+        for value in [
+            json!({"ssh":{"host":"-evil"}}),
+            json!({"ssh":{"host":"vps","user":"dev","workspace":"/srv/../etc"}}),
+            json!({"ssh":{"host":"vps","user":"dev","workspace":"/srv","port":0}}),
+        ] {
+            assert!(from_workspace_meta_checked(&value).is_err());
+        }
+        assert!(from_workspace_meta_checked(&json!({"other":true}))
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn lookup_uses_registered_ancestor_and_refuses_corrupt_meta() {
+        let connection = rusqlite::Connection::open_in_memory().unwrap();
+        connection
+            .execute_batch("CREATE TABLE workspaces(path TEXT, meta TEXT)")
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO workspaces VALUES(?1,?2)",
+                rusqlite::params![
+                    "/srv/proj",
+                    json!({"ssh":{"host":"vps","user":"dev","workspace":"/srv/proj"}}).to_string()
+                ],
+            )
+            .unwrap();
+        connection
+            .execute("INSERT INTO workspaces VALUES('/srv/broken','{')", [])
+            .unwrap();
+        let db = crate::db::Db(parking_lot::Mutex::new(connection));
+        assert_eq!(
+            transport_for_path(&db, "/srv/proj/src/main.rs")
+                .unwrap()
+                .unwrap()
+                .workspace
+                .as_deref(),
+            Some("/srv/proj")
+        );
+        assert!(transport_for_path(&db, "/srv/project").unwrap().is_none());
+        assert!(transport_for_path(&db, "/srv/proj/../etc").is_err());
+        assert!(transport_for_path(&db, "/srv/broken/file").is_err());
+    }
+
+    #[cfg(unix)]
+    fn upload_fixture(script: &str) -> Command {
+        let mut command = Command::new("python3");
+        command.args(["-u", "-c", script]);
+        command
+    }
+
+    #[cfg(unix)]
+    struct UploadPidFile(PathBuf);
+
+    #[cfg(unix)]
+    impl UploadPidFile {
+        fn new() -> Self {
+            Self(std::env::temp_dir().join(format!(
+                "ccgui-upload-{}.pid",
+                uuid::Uuid::new_v4().simple()
+            )))
+        }
+
+        async fn pid(&self) -> u32 {
+            tokio::time::timeout(Duration::from_secs(3), async {
+                loop {
+                    if let Ok(text) = std::fs::read_to_string(&self.0) {
+                        if let Ok(pid) = text.trim().parse() {
+                            return pid;
+                        }
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .expect("upload fixture did not start")
+        }
+    }
+
+    #[cfg(unix)]
+    impl Drop for UploadPidFile {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.0);
+        }
+    }
+
+    #[cfg(unix)]
+    async fn assert_upload_fixture_exited(pid: u32) {
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while unsafe { libc::kill(pid as libc::pid_t, 0) } == 0 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("upload child survived timeout/cancellation");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn upload_drains_stderr_before_child_reads_large_stdin() {
+        let body = "x".repeat(1024 * 1024);
+        let command = upload_fixture(
+            "import sys; sys.stderr.write('diagnostic-'*100000); sys.stderr.flush(); body=sys.stdin.buffer.read(); sys.exit(0 if len(body)==1048576 else 4)"
+        );
+        upload_child(command, &body, Duration::from_secs(5))
+            .await
+            .unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn upload_timeout_keeps_bounded_diagnostics_and_kills_blocked_writer() {
+        let pid_file = UploadPidFile::new();
+        let mut command = upload_fixture(
+            "import os,sys,time; open(sys.argv[1],'w').write(str(os.getpid())); sys.stderr.write('upload-stalled\\n'+'x'*1048576); sys.stderr.flush(); time.sleep(10)"
+        );
+        command.arg(&pid_file.0);
+        let error = upload_child(
+            command,
+            &"x".repeat(1024 * 1024),
+            Duration::from_millis(300),
+        )
+        .await
+        .unwrap_err();
+        assert!(error.contains("writing SSH stdin"), "{error}");
+        assert!(error.contains("upload-stalled"));
+        assert!(error.len() < 17 * 1024, "diagnostics must remain bounded");
+        assert_upload_fixture_exited(pid_file.pid().await).await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn upload_write_and_wait_share_one_deadline_and_keep_exit_diagnostic() {
+        let command = upload_fixture(
+            "import sys,time; sys.stderr.write('waiting-exit\\n'); sys.stderr.flush(); time.sleep(.2); sys.stdin.buffer.read(); time.sleep(.2)"
+        );
+        let error = upload_child(
+            command,
+            &"x".repeat(1024 * 1024),
+            Duration::from_millis(300),
+        )
+        .await
+        .unwrap_err();
+        assert!(error.contains("waiting for SSH exit"), "{error}");
+        assert!(error.contains("waiting-exit"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn upload_cancellation_kills_only_its_owned_child() {
+        let pid_file = UploadPidFile::new();
+        let mut command = upload_fixture(
+            "import os,sys,time; open(sys.argv[1],'w').write(str(os.getpid())); time.sleep(10)",
+        );
+        command.arg(&pid_file.0);
+        let task = tokio::spawn(async move {
+            upload_child(command, &"x".repeat(1024 * 1024), Duration::from_secs(30)).await
+        });
+        let pid = pid_file.pid().await;
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        assert_upload_fixture_exited(pid).await;
+    }
+
+    /// Opt-in against a disposable directory on a configured Linux host.
+    /// This runs Python/sleep only and never sends a model request.
+    #[tokio::test]
+    #[ignore = "requires CCGUI_SSH_TEST_HOST, CCGUI_SSH_TEST_USER and optional CCGUI_SSH_TEST_KEY"]
+    async fn ssh_supervisor_stops_group_and_preserves_stdin() {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+        let transport = WslTransport {
+            host: std::env::var("CCGUI_SSH_TEST_HOST").expect("test host"),
+            user: std::env::var("CCGUI_SSH_TEST_USER").expect("test user"),
+            port: 22,
+            distro: String::new(),
+            identity_file: std::env::var("CCGUI_SSH_TEST_KEY").ok(),
+            control_path: None,
+            engine_paths: HashMap::new(),
+            workspace: Some("/tmp".into()),
+        };
+        let mut command = Command::new("python3");
+        command.args(["-c", "import os,sys,time,subprocess; child=subprocess.Popen(['sleep','120']); print(str(os.getpid())+' '+str(child.pid),flush=True); print(sys.stdin.readline().strip(),flush=True); time.sleep(120)"]);
+        let mut wrapped = wrap(command, &transport).await.unwrap();
+        wrapped
+            .command
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let mut child = wrapped.command.spawn().unwrap();
+        let mut stdin = child.stdin.take().unwrap();
+        stdin.write_all(b"permission-answer\n").await.unwrap();
+        stdin.flush().await.unwrap();
+        let mut stdout = BufReader::new(child.stdout.take().unwrap());
+        let mut pids = String::new();
+        tokio::time::timeout(Duration::from_secs(15), stdout.read_line(&mut pids))
+            .await
+            .unwrap()
+            .unwrap();
+        let pids: Vec<u32> = pids
+            .split_whitespace()
+            .map(|pid| pid.parse().unwrap())
+            .collect();
+        assert_eq!(pids.len(), 2);
+        let mut answer = String::new();
+        tokio::time::timeout(Duration::from_secs(5), stdout.read_line(&mut answer))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(answer.trim(), "permission-answer");
+        child.start_kill().unwrap();
+        child.wait().await.unwrap();
+        let check = format!("sleep 5; ps -o stat= -p {},{} || true", pids[0], pids[1]);
+        let states = run_script_output(&transport, &check).await.unwrap();
+        // A zombie has exited and cannot run tools; init will reap it.
+        assert!(
+            states.lines().all(|state| state.trim().starts_with('Z')),
+            "remote processes survived: {states}"
+        );
+        for file in wrapped.cleanup_files {
+            let _ = std::fs::remove_file(file);
+        }
+    }
+
+    /// Read-only marker commands only. This fixture owns a previously unused
+    /// private socket and closes that master; it does not touch the live CLI.
+    #[cfg(unix)]
+    #[tokio::test]
+    #[ignore = "requires CCGUI_SSH_LIVE_HOST/USER/KEY and an unused read-only control socket"]
+    async fn ssh_readonly_mux_cold_and_warm_batches() {
+        use std::sync::Arc;
+        use std::time::Instant;
+        let transport = WslTransport {
+            host: std::env::var("CCGUI_SSH_LIVE_HOST").expect("test host"),
+            user: std::env::var("CCGUI_SSH_LIVE_USER").expect("test user"),
+            port: 22,
+            distro: String::new(),
+            identity_file: std::env::var("CCGUI_SSH_LIVE_KEY").ok(),
+            control_path: None,
+            engine_paths: HashMap::new(),
+            workspace: Some("/tmp".into()),
+        };
+        let path = super::super::ssh_rpc_mux::control_path(
+            &transport.host,
+            &transport.user,
+            transport.port,
+            transport.identity_file.as_deref(),
+        )
+        .unwrap()
+        .unwrap();
+        assert!(
+            std::fs::symlink_metadata(&path).is_err(),
+            "test will not take over an existing master"
+        );
+        struct Cleanup {
+            transport: WslTransport,
+            path: PathBuf,
+            active: bool,
+        }
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                if self.active {
+                    let _ = std::process::Command::new("ssh")
+                        .args(ssh_options(&self.transport))
+                        .args([
+                            "-S",
+                            self.path.to_str().unwrap(),
+                            "-O",
+                            "exit",
+                            "--",
+                            &ssh_target(&self.transport),
+                        ])
+                        .stdin(Stdio::null())
+                        .stdout(Stdio::null())
+                        .stderr(Stdio::null())
+                        .status();
+                }
+            }
+        }
+        let mut cleanup = Cleanup {
+            transport: transport.clone(),
+            path: path.clone(),
+            active: true,
+        };
+        let transport = Arc::new(transport);
+        for (label, count) in [("cold", 3), ("warm", 10)] {
+            let started = Instant::now();
+            let mut tasks = Vec::new();
+            for index in 0..count {
+                let transport = Arc::clone(&transport);
+                tasks.push(tokio::spawn(async move {
+                    let marker = format!("CCGUI_READONLY_{label}_{index}");
+                    let script = format!("printf '%s' {}", sh_quote(&marker));
+                    let started = Instant::now();
+                    let output = run_readonly_script_output(&transport, &script)
+                        .await
+                        .unwrap();
+                    assert_eq!(output, marker);
+                    started.elapsed().as_millis()
+                }));
+            }
+            let mut durations = Vec::new();
+            for task in tasks {
+                durations.push(task.await.unwrap());
+            }
+            eprintln!(
+                "readonly {label} batch: elapsed_ms={}, rpc_ms={durations:?}",
+                started.elapsed().as_millis()
+            );
+        }
+        let control = |operation: &str| {
+            let mut command = Command::new("ssh");
+            command.args(ssh_options(&transport));
+            command.args([
+                "-S",
+                path.to_str().unwrap(),
+                "-O",
+                operation,
+                "--",
+                &ssh_target(&transport),
+            ]);
+            command
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .kill_on_drop(true);
+            command
+        };
+        assert!(
+            tokio::time::timeout(Duration::from_secs(5), control("check").status())
+                .await
+                .unwrap()
+                .unwrap()
+                .success()
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_secs(5), control("exit").status())
+                .await
+                .unwrap()
+                .unwrap()
+                .success()
+        );
+        cleanup.active = false;
+        eprintln!("readonly test master checked and closed");
     }
 }

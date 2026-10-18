@@ -22,6 +22,7 @@ import { centerColumnClass } from "../chat-column";
 import { ComposerSlotExtras } from "@/features/plugins/boundary/composer-slot-extras";
 import { COMPOSER_DRAFT_TOPIC, pluginBus } from "@/features/plugins/runtime/events";
 import { USAGE_PART_LABEL_KEYS, usageBreakdown } from "./usage-breakdown";
+import { ClaudeQuotaButton } from "@/features/claude-usage/ClaudeQuotaButton";
 import { useComposerFileDrop } from "./use-composer-file-drop";
 import {
   hasPendingUserInput,
@@ -405,6 +406,7 @@ function FooterStatusBar({
         selectedFolder={active ? baseName(active.workspacePath) : undefined}
         onFolderSelect={handleFolderSelect}
         usagePct={usage?.pct}
+        accountUsage={active?.engine === "claude" ? <ClaudeQuotaButton workspacePath={active.workspacePath} workspaces={workspaces} streaming={streaming} /> : undefined}
         contextMax={contextMax}
         contextSegments={contextSegments}
         onCompactContext={handleCompact}

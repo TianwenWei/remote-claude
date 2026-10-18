@@ -161,6 +161,7 @@ export default function ChatPage() {
     sections,
     archivedRepos,
     handleAddWorkspace,
+    handleNewRemoteProject,
     handleThreadSelect,
     handleThreadAction,
     handleCopyThreadId,
@@ -237,6 +238,7 @@ export default function ChatPage() {
         onThreadAction={handleThreadAction}
         onCopyThreadId={handleCopyThreadId}
         onAddWorkspace={handleAddWorkspace}
+        onNewRemoteProject={handleNewRemoteProject}
         onRemoveWorkspace={handleRemoveWorkspace}
         onWorkspaceAlias={handleWorkspaceAlias}
         onSetWorkspaceArchived={handleSetWorkspaceArchived}
@@ -282,6 +284,7 @@ export default function ChatPage() {
             active ? (
               <ChatPanelHeader
                 workspacePath={active.workspacePath}
+                activeTabKey={activeTabKey}
                 panelTab={panelTab}
                 onPanelTabChange={setPanelTab}
                 panelCollapsed={panelCollapsedEffective}

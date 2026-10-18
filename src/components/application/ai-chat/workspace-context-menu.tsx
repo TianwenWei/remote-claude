@@ -13,6 +13,7 @@ import { ContextMenu, type ContextMenuEntry } from "@/components/context-menu";
 import { useChatStore } from "@/features/chat/store";
 import { useWorktreeStore } from "@/features/worktree/store";
 import { ipc, worktreeMetaOf, type Workspace } from "@/lib/ipc";
+import { sshWorkspaceMetaOf } from "@/lib/ssh-workspace";
 import {
   compareByOrder,
   pluginIdFromRegistryKey,
@@ -72,7 +73,8 @@ function buildWorkspaceMenuEntries({
   onDeleteWorktree,
 }: WorkspaceMenuEntriesOptions): (ContextMenuEntry | "separator")[] {
   const entries: (ContextMenuEntry | "separator")[] = [];
-  if (onNewWorktree && workspace) {
+  const remote = sshWorkspaceMetaOf(workspace) !== null;
+  if (onNewWorktree && workspace && !remote) {
     entries.push({
       id: "new-worktree",
       label: t("worktree.newWorktree"),
@@ -88,7 +90,7 @@ function buildWorkspaceMenuEntries({
       onSelect: () => onSetAlias(menu.workspaceId),
     });
   }
-  if (isWorktree && workspace) {
+  if (isWorktree && workspace && !remote) {
     entries.push({
       id: "reveal-worktree",
       label: revealLabel(t),

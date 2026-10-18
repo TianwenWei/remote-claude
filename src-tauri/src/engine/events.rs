@@ -81,6 +81,14 @@ pub enum EngineEvent {
     /// A parked question no longer needs an answer (the CLI cancelled it or
     /// the run settled): the UI resolves the card without a choice.
     QuestionSettled { request_id: String },
+    /// A native remote client waits for an explicit one-call tool decision.
+    #[cfg(feature = "remote-vps")]
+    ToolPermissionQuestion {
+        request_id: String,
+        tool_use_id: Option<String>,
+        tool_name: String,
+        input: Value,
+    },
     /// 计划草稿的流式预览:正文不完整,任何批准路径都必须拒绝。
     /// `replace` = 引擎给的是全量快照(如 ACP plan.entries),否则追加。
     PlanDraft {

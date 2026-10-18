@@ -6,6 +6,7 @@ import ChevronRight from "lucide-react/dist/esm/icons/chevron-right";
 import type { Message, QuestionSpec } from "@/lib/ipc";
 import { useChatStore } from "../store";
 import { useScopedSessionKey } from "../split/session-scope";
+import { ToolPermissionCard, ToolPermissionRecord } from "./ToolPermissionCard";
 
 /**
  * AskUserQuestion panel (dock form): the CLI parked the question on the
@@ -317,6 +318,12 @@ function QuestionOptions({
 }
 
 export function QuestionCard({ message }: { message: Message }) {
+  return message.question?.toolPermission
+    ? <ToolPermissionCard key={message.question.requestId} message={message} />
+    : <AskQuestionCard message={message} />;
+}
+
+function AskQuestionCard({ message }: { message: Message }) {
   const { t } = useTranslation();
   const rootRef = useRef<HTMLDivElement>(null);
   const question = message.question;
@@ -424,6 +431,7 @@ export function QuestionRecord({ message }: { message: Message }) {
   const { t } = useTranslation();
   const question = message.question;
   if (!question) return null;
+  if (question.toolPermission) return <ToolPermissionRecord message={message} />;
   const { status, questions } = question;
   return (
     <div className="flex max-w-[85%] flex-col gap-1 rounded-xl border border-border-secondary bg-background-secondary-default px-3.5 py-2.5 text-left">
