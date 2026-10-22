@@ -1,0 +1,80 @@
+name: Bug report
+description: Report a reproducible problem in Remote Claude.
+title: "[Bug]: "
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Please describe the smallest reproducible example. Redact credentials, private keys, tokens, private addresses, and personal file paths from errors and screenshots. Do not paste full SSH configurations, environment dumps, or complete conversations.
+  - type: input
+    id: app-version
+    attributes:
+      label: Remote Claude version
+      description: Include the build number and whether you downloaded the app or built it locally, if known.
+      placeholder: Version / build / installation source
+    validations:
+      required: true
+  - type: dropdown
+    id: mac-chip
+    attributes:
+      label: Mac chip
+      options:
+        - Apple silicon
+        - Intel
+        - Unsure
+    validations:
+      required: true
+  - type: input
+    id: macos-version
+    attributes:
+      label: macOS version
+      placeholder: "e.g. macOS 15.7"
+    validations:
+      required: true
+  - type: textarea
+    id: vps-versions
+    attributes:
+      label: VPS environment and tool versions
+      description: Include the Linux distribution and Bash, Python, Git, and Claude Code versions if known. Write "unknown" for unavailable details; version numbers are enough.
+      placeholder: |
+        Linux:
+        Bash:
+        Python:
+        Git:
+        Claude Code:
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Steps to reproduce
+      description: Include relevant connection or workspace actions without private connection details.
+      placeholder: |
+        1.
+        2.
+        3.
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behavior
+      description: Mention whether the problem is consistent or intermittent.
+    validations:
+      required: true
+  - type: textarea
+    id: error
+    attributes:
+      label: Redacted error or screenshot
+      description: Include the exact relevant error after redacting sensitive data. Attach only the minimum necessary excerpt or screenshot.
+  - type: checkboxes
+    id: privacy
+    attributes:
+      label: Privacy check
+      options:
+        - label: I removed credentials, private keys, tokens, and sensitive conversation content from this report and its attachments.
+          required: true

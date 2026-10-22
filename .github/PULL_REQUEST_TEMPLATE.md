@@ -1,18 +1,19 @@
-<!--
-Thanks for contributing! A bot check enforces the base-branch rule below,
-so getting this right up front saves a round trip.
--->
+## Problem
 
-## Base branch
+<!-- Describe the problem or need. Link related issues when applicable. -->
 
-- **Feature / fix PRs** → target the **active development branch** (e.g. `v1.0.6`), NOT `main`.
-- **`main`** only receives release PRs cut by a maintainer from a `vX.Y.Z` branch.
-- Wrong base? Click **Edit** at the top of the PR and change it — no rebase needed in most cases.
+## Changes
 
-## Description
+<!-- Explain the resulting behavior and any important limitations. -->
 
-<!-- What does this PR do? Link related issues. -->
+## Verification
 
-## Testing
+<!-- List the checks you actually ran and their results. Note anything not tested,
+especially native macOS behavior or real SSH access. Do not include credentials
+or complete conversations in commands, logs, or screenshots. -->
 
-<!-- How did you verify this change? -->
+## Related documentation
+
+<!-- Link documentation updated by this PR, or explain why no update is needed. -->
+
+- [ ] I reviewed the diff and attachments for credentials, private keys, tokens, and sensitive conversation content.

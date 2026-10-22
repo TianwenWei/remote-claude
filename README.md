@@ -2,124 +2,171 @@
 
 # Remote Claude
 
-**在 Mac 上使用自己的 VPS，运行 Claude Code。**
+**Claude Code on your VPS. A desktop workspace on your Mac.**
 
-Remote Claude 是一个 macOS 桌面客户端，通过 SSH 连接 Linux VPS，在本地窗口中管理远程项目、与 Claude Code 对话、查看文件和使用终端。你使用自己的服务器与 Claude 账号；Claude Code、项目文件和账号登录保存在 VPS，界面和历史缓存保存在 Mac。
+**English** · [简体中文](README.zh-CN.md)
 
-本项目基于 [CC GUI](https://github.com/zhukunpenglinyutong/desktop-cc-gui) 开发，专注于 Claude Code 的远程工作区体验，是独立的第三方客户端。
+[VPS setup](#prepare-your-vps) · [Getting started](#getting-started) · [Development](#development) · [Contributing](CONTRIBUTING.md)
 
-> 当前为预览版。已验证的安装包面向 Apple Silicon Mac，采用 ad-hoc 签名，尚未完成 Apple 公证。安装包由维护者单独提供；源码仓库不包含编译产物。
+Remote Claude is a macOS desktop client for Claude Code running on a Linux VPS over SSH. Chat with Claude, manage remote projects, edit files, review Git changes, and open a terminal in one window.
 
-## 主要功能
+It is for developers who want to keep their repositories, development tools, and Claude Code execution on their own server while working through a desktop interface. Install **Remote Claude on your Mac** and **Claude Code on your VPS**. Commands, builds, tests, and file changes run on the VPS using that server's environment.
 
-- **远程对话**：流式回复、工具调用展示、权限问答和任务停止。
-- **项目管理**：添加 VPS 上的已有项目，或在选定父目录下创建新项目。
-- **文件与 Git**：浏览、编辑、搜索远程文件，执行常用 Git 操作。
-- **集成终端**：在窗口底部直接使用 VPS 的 SSH 终端。
-- **历史缓存**：优先展示本地缓存，后台更新；断网时仍可查看已缓存会话。
-- **用量展示**：分别查看上下文用量，以及支持该查询的 Claude 账号 5 小时和周额度。
-- **首次连接引导**：选择本机私钥、核验服务器指纹、检查远端工具和 Claude 登录状态。
+Bring your own server and Claude account. Claude authentication stays on the VPS; the interface and history cache run on your Mac. The client connects directly over SSH. This is an independent third-party project, derived from [CC GUI](https://github.com/zhukunpenglinyutong/desktop-cc-gui).
 
-## 界面预览
+> **Preview · macOS / Apple Silicon.** The current preview is distributed privately by the maintainer. Packages use ad-hoc signing and are not notarized by Apple. Compiled applications are not stored in this repository. See [current limitations](#current-limitations) before installing.
 
-以下截图来自客户端实际界面组件，项目、会话和终端输出均为演示数据。
+## Prepare your VPS
 
-**远程项目与对话**
+Before opening the app, prepare a Linux user with SSH access and permission to write to your project directories. Use **the same Linux user** to install and sign in to Claude Code and to connect from Remote Claude. Enable the VPS's SSH service and allow its port in your firewall or cloud security group. The VPS must also be able to reach Claude's services.
 
-![Remote Claude 的项目列表、会话与聊天界面](docs/screenshots/remote-chat.png)
+### 1. Install tools and sign in on the VPS
 
-**窗口底部的 SSH 终端**
+The following is an **Ubuntu/Debian example**, assuming you can already log in to the VPS. Run it in a VPS terminal as the user you will connect with. Use your distribution's package manager on other systems. Only the system-package step uses `sudo`.
 
-![Remote Claude 的集成终端](docs/screenshots/remote-terminal.png)
+```sh
+sudo apt-get update
+sudo apt-get install -y bash python3 git curl ca-certificates util-linux
+```
 
-**首次 SSH 连接配置**
+Install Claude Code as that Linux user using the [official Linux installer](https://code.claude.com/docs/en/setup), then authenticate:
 
-![Remote Claude 的 SSH 主机、密钥与远程目录配置](docs/screenshots/ssh-setup.png)
+```sh
+curl -fsSL https://claude.ai/install.sh | bash
+export PATH="$HOME/.local/bin:$PATH"
+claude --version
+claude auth login
+claude auth status
+mkdir -p "$HOME/projects"
+```
 
-## 工作方式
+Ensure `~/.local/bin` is also on this user's **login-shell PATH**. The `export` above affects the current terminal only; for Bash, add that line to the login profile the user loads, such as `~/.profile` or `~/.bash_profile`. The fresh SSH check below verifies that the app can find Claude Code outside your interactive terminal.
+
+On a server without a browser, open the login URL on your Mac and follow the terminal's instructions, including pasting a code back if prompted. See the [official authentication guide](https://code.claude.com/docs/en/authentication). Sign in with an account that has Claude Code access, then start `claude` in a project directory and confirm that a conversation works.
+
+Put your repositories and their development dependencies on the VPS. You can use `~/projects` as a parent directory and add an existing project or create a new one from the app. The client uses the existing SSH service; you do not need to deploy a separate Remote Claude web service.
+
+### 2. Enable SSH key access from your Mac
+
+Add your Mac's **public** SSH key to the VPS user's `~/.ssh/authorized_keys`, or use your cloud provider's SSH key setup. Keep the private key on your Mac. The [first-connection guide](docs/remote-claude-trial.zh-CN.md) (Chinese) includes key creation and server-fingerprint checks.
+
+In a **new Mac terminal**, verify key-based access and the remote login environment. Replace the placeholder user, host, and port with your own; add `-i /path/to/private-key` if using a non-default key:
+
+```sh
+ssh -p 22 -o PreferredAuthentications=publickey your-user@your-vps.example.com 'bash -lc "command -v claude && claude auth status"'
+```
+
+Verify the server's host fingerprint through a trusted channel before accepting it. If your key requires a passphrase, load it into your Mac's SSH agent with `ssh-add`. The check should print the Claude executable path and a signed-in authentication status. If it cannot find `claude`, fix the remote user's login-shell PATH first. Once this works, continue with [app installation and connection](#getting-started).
+
+## A workspace for remote development
+
+- **Chat and control tasks** — streamed responses, tool activity, permission requests, and task cancellation.
+- **Organize projects** — add an existing VPS directory or create a project in a chosen parent directory.
+- **Work with files and Git** — browse, edit, search, and perform common Git operations on the VPS.
+- **Use an integrated terminal** — open a remote SSH shell at the bottom of the window.
+- **Keep history available** — read the local cache first, refresh in the background, and view cached conversations offline.
+- **Track usage** — see conversation context usage separately from account-wide five-hour and weekly limits, when available.
+- **Set up SSH in the app** — select a local key, verify the server fingerprint, and check remote tools and Claude authentication.
+
+## Screenshots
+
+These screenshots use the application's actual UI components with demo projects, conversations, and terminal output.
+
+**Remote projects and chat**
+
+![Remote Claude project sidebar, conversations, and chat](docs/screenshots/remote-chat.png)
+
+**Integrated SSH terminal**
+
+![SSH terminal below the remote conversation](docs/screenshots/remote-terminal.png)
+
+**First connection**
+
+![SSH host, key, and remote directory setup](docs/screenshots/ssh-setup.png)
+
+## How it works
 
 ```text
 Mac · Remote Claude
-  聊天界面 / 连接设置 / 本地历史缓存
-                │
-          SSH 密钥认证
-                │
+  Interface · connection settings · history cache
+                     │
+              SSH key authentication
+                     │
 Linux VPS
-  Claude Code / 项目文件 / Git / Shell
-                │
-       用户自己的 Claude 账号
+  Claude Code · project files · Git · shell
+                     │
+              Your Claude account
 ```
 
-Mac 无需安装 Claude Code，VPS 无需部署额外的 Web 服务。客户端使用 SSH 密钥认证，并保留 OpenSSH 的主机身份校验。
+Your Mac does not need Claude Code installed. The VPS does not need an additional web service. Connections use SSH key authentication and retain OpenSSH host identity checks.
 
-## 使用要求
+## Requirements
 
-| 环境 | 要求 |
+| Component | Requirement |
 | --- | --- |
-| Mac | macOS；当前已验证 Apple Silicon 安装包 |
-| VPS | 可通过 SSH 访问的 Linux 主机，以及可访问项目目录的用户 |
-| 必需工具 | VPS 上的 Bash、Python 3、Claude Code |
-| 可选工具 | VPS 上的 Git，用于 Git 功能 |
-| Claude 登录 | VPS 对应用户已登录具备 Claude Code 使用权限的账号；CLI 支持结构化登录状态查询 |
-| SSH 认证 | Mac 上可用的 SSH 私钥、系统默认密钥或 SSH agent |
-| 网络 | Mac 能访问 VPS 的 SSH 端口；VPS 能访问 Claude 服务 |
+| Mac | macOS; Apple Silicon is the currently validated architecture |
+| Server | A Linux VPS reachable over SSH, with a user that can access the project directory |
+| Remote tools | Bash, Python 3, `setsid` (provided by `util-linux` on Ubuntu/Debian), and Claude Code; Git is optional for Git features |
+| Claude account | Claude Code signed in as the remote user, with access to Claude Code and a CLI that supports structured authentication status |
+| SSH authentication | A usable private key on the Mac, a default SSH key, or an SSH agent |
+| Connectivity | Mac → VPS SSH port; VPS → Claude services |
 
-Claude Code 的安装与登录方式见 [官方说明](https://code.claude.com/docs/en/setup)。
+For Claude Code installation and authentication, see the [official setup guide](https://code.claude.com/docs/en/setup).
 
-## 快速开始
+## Getting started
 
-### 1. 准备 VPS 和 SSH
+### 1. Prepare your VPS
 
-在 VPS 上安装所需工具，以准备使用的 Linux 用户运行 `claude` 并完成登录。先确认终端中能够正常使用 Claude Code。
+Complete the [VPS setup above](#prepare-your-vps): working SSH key access, remote tools, Claude Code authentication, and a writable project directory. Have the server's SHA256 host fingerprint ready from your cloud provider's console or an existing trusted server session.
 
-将 Mac 的 SSH 公钥加入 VPS 对应用户的 `~/.ssh/authorized_keys`。私钥保留在 Mac；加密私钥可以先通过 `ssh-add` 加载到系统 SSH agent。
+### 2. Install the app
 
-从云厂商控制台或已有的可信服务器会话取得 SSH 主机 SHA256 指纹，用于首次连接时核验服务器身份。
+Obtain a preview package and its checksum manifest from the maintainer, or [build from source](#development). Open the DMG and drag `Remote Claude.app` into `Applications`.
 
-详细步骤见 [安装与首次连接指南](docs/remote-claude-trial.zh-CN.md)。
+Current preview packages are not notarized, so macOS may warn that the developer cannot be verified. Verify the package source and SHA256, then follow the operating system's security prompts. Packaging with your own Developer ID is supported by the build script; see [packaging](#packaging).
 
-### 2. 安装应用
+### 3. Connect a project
 
-取得与你的 Mac 芯片匹配的安装包及校验清单。打开 DMG，将 `Remote Claude.app` 拖入 `Applications`，然后启动应用。
+Open **Settings → Workspaces → SSH remote projects** and enter:
 
-当前提供的预览包未经 Apple 公证，macOS 可能提示无法验证开发者。请核对包的来源与 SHA256，并按系统提供的安全提示处理。正式签名与公证的构建入口见下方说明。
-
-### 3. 添加远程项目
-
-打开 **设置 → 工作区 → SSH 远程项目**，填写连接信息：
-
-| 配置项 | 说明 |
+| Field | What to enter |
 | --- | --- |
-| SSH 主机 | VPS 的 IP 地址或 DNS 名称 |
-| SSH 用户 | VPS 上已准备好 Claude Code 和项目权限的 Linux 用户 |
-| SSH 端口 | 默认 `22` |
-| 私钥 | 用文件选择器选择这台 Mac 上的私钥；留空使用默认密钥或 SSH agent |
-| 项目目录 | 默认 `~`，表示远程用户主目录；连接后可浏览并选择项目文件夹 |
+| SSH host | Your VPS IP address or DNS name |
+| SSH user | The Linux user with Claude Code configured and access to the project |
+| SSH port | `22`, unless your server uses another port |
+| Private key | Select a key on your Mac, or leave blank to use default keys or an SSH agent |
+| Project directory | `~` starts at the remote user's home directory; browse after connecting |
 
-点击 **连接并浏览目录**。首次接入新主机时，核对显示的指纹与可信渠道取得的指纹，确认一致后显式信任。应用随后检查工具和 Claude 登录状态；准备就绪后，选择项目目录并点击 **添加此远程项目**。
+Connect and browse directories. For a new host, compare the displayed fingerprint with the trusted fingerprint you obtained earlier, then explicitly trust the matching key. The app checks remote tools and Claude authentication before you select and add a project directory.
 
-主机密钥发生变化时，应用会阻止连接，不会自动替换原有信任记录。
+A changed host key blocks the connection; the app does not silently replace an existing trust record.
 
-### 4. 开始使用
+### 4. Start working
 
-从侧边栏打开项目并创建会话。聊天、文件操作、Git 和底部终端均作用于该 VPS。
+Open the project from the sidebar and create a conversation. Chat, file operations, Git, and the integrated terminal operate on that VPS.
 
-需要新项目时，点击侧边栏的 **新建远程项目**，选择 VPS 上的父目录，填写项目名称，再点击 **创建并添加项目**。同名目录不会被覆盖。
+To start a new project, choose **New remote project** in the sidebar, select a parent directory on the VPS, and enter a project name. An existing directory with the same name will not be overwritten.
 
-## 数据与凭据
+A more detailed [installation and first-connection guide](docs/remote-claude-trial.zh-CN.md) is available in Chinese.
 
-- **本地数据目录**：`~/.ccgui-remote-vps`，保存应用设置、工作区信息和历史缓存。
-- **应用身份**：Bundle ID 为 `local.ccgui.remote-vps`，与上游 CC GUI 的数据目录分开。
-- **SSH 私钥**：客户端保存文件路径，密钥认证由本机 SSH 完成；私钥不会复制到 VPS。
-- **Claude 登录**：由 VPS 上的 Claude Code 管理。账号额度查询也在 VPS 执行，OAuth 令牌不传回 Mac。
-- **模型配置**：远程项目使用 VPS 自身的 Claude 配置，不发送 Mac 上配置的模型渠道密钥。
-- **离线历史**：已缓存的会话可离线查看；首次读取、获取新消息和执行操作需要联网。
+## Data and credentials
 
-上下文用量与账号额度是两个独立指标。额度查询依赖 Claude 内部接口，字段或认证方式可能变化；无法取得数据时显示未知，不推算剩余额度。
+| Data | Where it lives |
+| --- | --- |
+| App settings, workspace records, and history cache | `~/.ccgui-remote-vps` on your Mac |
+| Project files and Claude Code sessions | Your VPS |
+| SSH private key | Your Mac; the app stores its path and uses local SSH for authentication |
+| Claude authentication and quota-query OAuth token | Your VPS; the token is not returned to the Mac |
 
-## 从源码构建
+Remote workspaces use the VPS's Claude configuration. Model-provider keys configured on the Mac are not forwarded to the server. The app uses the bundle identifier `local.ccgui.remote-vps` and a data directory separate from upstream CC GUI.
 
-需要 macOS、Xcode Command Line Tools、Node.js、pnpm 和 Rust stable。项目使用 `pnpm@10.29.3`；制作分发包还需要 Python 3。
+Only previously cached conversations are available offline. Fetching new messages and running tasks require a connection.
+
+Conversation context usage and account limits are separate measurements. Account usage queries depend on an internal Claude endpoint that may change; unavailable values are shown as unknown rather than estimated.
+
+## Development
+
+Native builds require macOS, Xcode Command Line Tools, Node.js, pnpm, and Rust stable. The repository pins `pnpm@10.29.3`. Packaging also requires Python 3.
 
 ```sh
 git clone git@github.com:TianwenWei/remote-claude.git
@@ -128,41 +175,41 @@ pnpm install --frozen-lockfile
 ./scripts/build-remote-macos.sh
 ```
 
-私有仓库需要相应的 GitHub 访问权限。使用源码 ZIP 时，解压后从安装依赖这一步开始即可。
+Cloning requires repository access. If you received a source archive, extract it and start at the dependency installation step.
 
-默认 Release 产物：
+The default release app is written to:
 
 ```text
 src-tauri/target/release/bundle/macos/Remote Claude.app
 ```
 
-开发模式：
+For development:
 
 ```sh
 pnpm exec tauri dev --features remote-vps --config src-tauri/tauri.remote.conf.json
 ```
 
-生成开发包：
+For a debug app bundle:
 
 ```sh
 ./scripts/build-remote-macos.sh --debug
 ```
 
-Remote 构建必须同时使用 `remote-vps` Cargo feature 与 `tauri.remote.conf.json`，以保留独立的应用身份、数据目录和更新配置。上面的构建脚本已经包含这两个参数。
+Remote builds require **both** the `remote-vps` Cargo feature and `tauri.remote.conf.json` to preserve the app identity, data isolation, and update configuration. The Remote build script supplies both. Use these commands rather than the upstream default build entry points.
 
-### 制作安装包
+### Packaging
 
 ```sh
 python3 scripts/package-remote-macos.py --ad-hoc
 ```
 
-默认生成 Apple Silicon 预览包，输出到 `artifacts/remote-claude-trial/`，包括 DMG、App ZIP、构建清单和 SHA256。清单记录源码提交、架构、签名和公证状态。
+This produces an Apple Silicon preview package in `artifacts/remote-claude-trial/`: a DMG, an app ZIP, a build manifest, and SHA256 checksums. The manifest records the source revision, architecture, signing, and notarization status.
 
-脚本也提供 Intel、Universal 以及自有 Developer ID 签名和公证参数。这些构建选项不代表对应平台或签名流程已完成验收。完整参数与操作说明见 [Remote 开发与构建说明](README.remote-vps.md)。
+The script also offers Intel, Universal, Developer ID signing, and notarization options. These options do not establish that those configurations have been validated. See the [Remote development and build guide](README.remote-vps.md) (Chinese) for details.
 
-## 验证
+### Validation
 
-常用本地检查：
+Local check examples:
 
 ```sh
 pnpm build
@@ -171,33 +218,37 @@ cargo test --manifest-path src-tauri/Cargo.toml --features remote-vps --lib engi
 node --test tests/xterm-production.test.mjs
 ```
 
-生产终端回归需要先执行 `pnpm build`。真实 SSH 与模型测试需要显式配置已授权的测试主机，详见 [Remote 开发与构建说明](README.remote-vps.md)。
+Run `pnpm build` before the production xterm test. Live SSH and model tests require an explicitly authorized test host and scope; see [CONTRIBUTING.md](CONTRIBUTING.md).
 
-当前预览包已通过干净源码构建、相关回归、原生启动及已配置 VPS 的只读连接检查；尚未完成不同用户 VPS、Intel Mac 和正式签名分发的兼容性验收。
+Validation so far centers on the maintainer's Apple Silicon Mac and authorized VPS. Compatibility across other VPS setups, Intel Macs, and a formally signed distribution has not been established. Passing local checks alone does not validate a live SSH connection.
 
-## 当前限制
+## Current limitations
 
-- 当前 Remote 版本面向 macOS 与 Linux VPS；不承诺上游所有引擎或平台的功能均适用于 SSH 工作区。
-- 不支持远程 Worktree 管理、本机电脑操作或本机记忆工具；Worktree 可在远程终端中管理。
-- 不同 SSH 主机使用相同或嵌套项目路径时，工作区注册仍有限制。
-- 首次连接检查对 ProxyJump、ProxyCommand、HostName 重定向、主机证书和自定义撤销策略等高级 SSH 配置有限制。
-- 旧版 Claude Code 无法提供可确认的登录状态时，会阻止首次注册并显示原因。
-- 上游自动更新已禁用；更新应用需手动替换安装包，已有设置和缓存继续保留。
+- This Remote variant targets macOS and Linux SSH servers. Upstream engines and desktop platforms are not all supported in remote workspaces.
+- Remote Worktree management, local computer-use tools, and local memory tools are unavailable. Worktrees can be managed in the remote terminal.
+- Registering identical or nested project paths across different SSH hosts has limitations.
+- The first-connection flow has limited support for advanced SSH configurations, including ProxyJump, ProxyCommand, HostName redirection, host certificates, and custom revocation policies.
+- Older Claude Code versions that cannot report a verifiable authentication status are blocked during initial setup with an explanation.
+- Upstream automatic updates are disabled. Update manually by replacing the app; settings and cached history are retained.
 
-## 常见问题
+## Troubleshooting
 
-| 情况 | 处理方式 |
+| Symptom | First check |
 | --- | --- |
-| SSH 超时或连接被关闭 | 检查 Mac 到 VPS 的网络、SSH 服务和认证；已缓存的历史仍可查看 |
-| 服务器指纹与记录冲突 | 通过服务器控制台核实主机身份及是否重装，再维护本机 OpenSSH 信任记录 |
-| 找不到 Claude Code 或未登录 | 在 VPS 对应用户的登录环境中安装、登录并检查 Claude Code |
-| 缺少 Git | 聊天项目仍可使用；安装 Git 后再使用 Git 功能 |
-| 账号额度显示未知 | 确认远端登录方式支持该查询；接口不可用时应用不会推算额度 |
+| SSH timeout or closed connection | Network reachability, the VPS SSH service, and key authentication; cached history remains readable |
+| Host key mismatch | Verify server identity and any reinstall through the server console before updating local OpenSSH trust records |
+| Claude Code missing or not signed in | Check installation and authentication in the remote user's login environment |
+| Git unavailable | Install Git on the VPS to enable Git features; chat remains available |
+| Account usage unknown | Confirm that the remote authentication method supports the query; unavailable quota data is not estimated |
 
-报告问题时，请提供版本、Mac 芯片与系统、错误阶段及错误文字。不要附上私钥、访问令牌或完整会话内容。
+## Feedback and contributions
 
-## 项目来源
+Reproducible bug reports, documentation improvements, and focused pull requests are welcome. Use the [bug report template](.github/ISSUE_TEMPLATE/bug_report.yml) and include the app version, Mac architecture and macOS version, reproduction steps, and redacted error text. Do not share private keys, tokens, or complete conversations.
 
-Remote Claude 基于 [zhukunpenglinyutong/desktop-cc-gui](https://github.com/zhukunpenglinyutong/desktop-cc-gui) 的 1.1.4 源码开发。感谢原项目及其贡献者。
+See [CONTRIBUTING.md](CONTRIBUTING.md) for development checks, live-test boundaries, and documentation conventions. The [English](README.md) and [Chinese](README.zh-CN.md) READMEs are maintained together.
 
-上游许可材料的现状、历史出处与 Claude 图标来源记录在 [UPSTREAM-NOTICE.md](UPSTREAM-NOTICE.md)。Claude 名称和图标属于相应权利人，本项目不是 Anthropic 官方产品。
+## Attribution and licensing materials
+
+Remote Claude is based on [zhukunpenglinyutong/desktop-cc-gui](https://github.com/zhukunpenglinyutong/desktop-cc-gui) 1.1.4. Thanks to its authors and contributors.
+
+The upstream snapshot lacks a root license file. Available licensing materials, historical references, and artwork provenance are recorded in [UPSTREAM-NOTICE.md](UPSTREAM-NOTICE.md); review that record before broader redistribution. The Claude name and artwork belong to their respective rights holders. Remote Claude is not an Anthropic product.
